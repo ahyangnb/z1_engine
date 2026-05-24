@@ -1,16 +1,13 @@
-# z1_engine
+# 介绍
+z1_engine 是一个桌面应用程序，支持Windows和MacOs以及Linux的开发工具，功能有android和flutter项目混淆，
+可以刷新代码为全新实现模式，只更改真实代码逻辑为新版实现方式，而不是简单增加垃圾代码，AI无法还原，突破谷歌【google play】
+和苹果【iOS app store】上架检测，以及全球国内外各大厂商市场检测，包括app被应用市场/系统报毒情况的解决，特征彻底改变。
 
-A new Flutter project.
+文件资源也不是简单的更改md5，或重新编码资源压缩，而是结构性完整更改。
 
-## Getting Started
+# 使用资格
+免费。
 
-This project is a starting point for a Flutter application.
+# 向我们反馈
+使用过程中有不兼容的，以及效果出错的，可以联系我的微信 q1666655，也有相关交流群可以拉。
 
-A few resources to get you started if this is your first Flutter project:
-
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
