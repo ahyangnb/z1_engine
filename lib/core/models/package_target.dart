@@ -1,0 +1,1 @@
+enum PackageTarget { android, flutter }
