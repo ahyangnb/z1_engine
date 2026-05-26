@@ -1,10 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:z1_engine/core/models/main_menu.dart';
+import 'package:z1_engine/features/duplication/pages/duplication_page.dart';
 import 'package:z1_engine/features/home/controllers/engine_menu_controller.dart';
 import 'package:z1_engine/features/home/widgets/top_menu_bar.dart';
 import 'package:z1_engine/features/obfuscation/pages/obfuscation_page.dart';
 import 'package:z1_engine/features/package/pages/package_page.dart';
+import 'package:z1_engine/features/package_security/pages/package_security_page.dart';
+import 'package:z1_engine/features/protect/pages/protect_page.dart';
+import 'package:z1_engine/features/sign/pages/sign_page.dart';
 import 'package:z1_engine/shared/widgets/placeholder_page.dart';
 
 class EngineHomePage extends StatelessWidget {
@@ -53,24 +57,20 @@ class _CurrentMenuContent extends StatelessWidget {
         return const ObfuscationPage();
       case MainMenu.package:
         return const PackagePage();
+      case MainMenu.channelPackage:
+        return const PlaceholderPage(
+          icon: Icons.sell_outlined,
+          title: '渠道包',
+          description: '渠道包界面预留，可继续接入母包上传、渠道配置、批量生成和产物导出。',
+        );
       case MainMenu.sign:
-        return const PlaceholderPage(
-          icon: Icons.verified_user_outlined,
-          title: '签名',
-          description: '签名配置界面预留，可继续接入证书、别名、密码和签名产物信息。',
-        );
+        return const SignPage();
+      case MainMenu.packageSecurity:
+        return const PackageSecurityPage();
       case MainMenu.protect:
-        return const PlaceholderPage(
-          icon: Icons.security_outlined,
-          title: '加固',
-          description: '加固配置界面预留，可继续接入加固策略、渠道和输出路径。',
-        );
+        return const ProtectPage();
       case MainMenu.duplication:
-        return const PlaceholderPage(
-          icon: Icons.compare_arrows_outlined,
-          title: '重复度',
-          description: '重复度检测界面预留，可继续接入源码、资源和构建产物检测项。',
-        );
+        return const DuplicationPage();
       case MainMenu.review:
         return const PlaceholderPage(
           icon: Icons.fact_check_outlined,

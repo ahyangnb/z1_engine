@@ -1,9 +1,14 @@
 import 'package:flutter/material.dart';
 
 class LogOutputPanel extends StatelessWidget {
-  const LogOutputPanel({super.key, required this.logs});
+  const LogOutputPanel({
+    super.key,
+    required this.logs,
+    this.emptyText = '暂无日志，点击执行混淆后查看输出。',
+  });
 
   final List<String> logs;
+  final String emptyText;
 
   @override
   Widget build(BuildContext context) {
@@ -29,7 +34,7 @@ class LogOutputPanel extends StatelessWidget {
             border: Border.all(color: const Color(0xFF293244)),
           ),
           child: SelectableText(
-            hasLogs ? logs.join('\n') : '暂无日志，点击执行混淆后查看输出。',
+            hasLogs ? logs.join('\n') : emptyText,
             style: const TextStyle(
               color: Color(0xFFE5E7EB),
               fontFamily: 'monospace',

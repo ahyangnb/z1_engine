@@ -5,6 +5,7 @@ import 'package:z1_engine/features/home/controllers/engine_menu_controller.dart'
 import 'package:z1_engine/shared/widgets/checkbox_grid.dart';
 import 'package:z1_engine/shared/widgets/contact_banner.dart';
 import 'package:z1_engine/shared/widgets/log_output_panel.dart';
+import 'package:z1_engine/shared/widgets/project_path_selector.dart';
 import 'package:z1_engine/shared/widgets/section_panel.dart';
 import 'package:z1_engine/shared/widgets/target_tabs.dart';
 
@@ -21,6 +22,20 @@ class ObfuscationPage extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          ProjectPathSelector(
+            value: controller.obfuscationProjectPath,
+            onChanged: context
+                .read<EngineMenuController>()
+                .updateObfuscationProjectPath,
+          ),
+          const SizedBox(height: 24),
+          Text(
+            '第二步：选择混淆类型',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 12),
           TargetTabs(
             selected: controller.selectedObfuscationTarget,
             androidLabel: 'android混淆',
@@ -31,7 +46,7 @@ class ObfuscationPage extends StatelessWidget {
           ),
           const SizedBox(height: 24),
           Text(
-            '混淆配置',
+            '第三步：混淆配置',
             style: Theme.of(
               context,
             ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
@@ -47,6 +62,13 @@ class ObfuscationPage extends StatelessWidget {
           const SizedBox(height: 22),
           const ContactBanner(text: '定制开发请联系我们'),
           const SizedBox(height: 24),
+          Text(
+            '第四步：执行并查看日志',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 12),
           _ObfuscationActions(controller: controller),
           const SizedBox(height: 18),
           LogOutputPanel(logs: controller.obfuscationLogs),
@@ -72,7 +94,9 @@ class _ObfuscationActions extends StatelessWidget {
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         FilledButton.icon(
-          onPressed: context.read<EngineMenuController>().executeObfuscation,
+          onPressed: controller.hasObfuscationProjectPath
+              ? context.read<EngineMenuController>().executeObfuscation
+              : null,
           icon: const Icon(Icons.play_arrow_outlined),
           label: Text('执行$targetLabel'),
         ),

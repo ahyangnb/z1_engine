@@ -4,9 +4,10 @@ import 'package:z1_engine/shared/widgets/display_field.dart';
 import 'package:z1_engine/shared/widgets/form_grid.dart';
 
 class PackageForm extends StatelessWidget {
-  const PackageForm({super.key, required this.target});
+  const PackageForm({super.key, required this.target, required this.canSubmit});
 
   final PackageTarget target;
+  final bool canSubmit;
 
   @override
   Widget build(BuildContext context) {
@@ -38,7 +39,13 @@ class PackageForm extends StatelessWidget {
         Align(
           alignment: Alignment.centerLeft,
           child: FilledButton.icon(
-            onPressed: null,
+            onPressed: canSubmit
+                ? () {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('当前为界面演示，实际出包逻辑待接入')),
+                    );
+                  }
+                : null,
             icon: const Icon(Icons.inventory_2_outlined),
             label: const Text('生成新包'),
           ),
