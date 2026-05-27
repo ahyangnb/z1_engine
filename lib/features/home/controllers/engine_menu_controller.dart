@@ -876,34 +876,54 @@ class EngineMenuController extends ChangeNotifier {
       candidates.add(_joinPath(localAppData, 'Android/Sdk'));
     }
 
-    return candidates.where((path) => Directory(path).existsSync());
+    return candidates.where(_directoryExistsSafely);
   }
 
   String? _findBuildToolExecutable(String sdkPath, String executableName) {
     final buildToolsDirectory = Directory(_joinPath(sdkPath, 'build-tools'));
-    if (!buildToolsDirectory.existsSync()) {
+    if (!_directoryExistsSafely(buildToolsDirectory.path)) {
       return null;
     }
 
-    final versions =
-        buildToolsDirectory.listSync().whereType<Directory>().toList()
-          ..sort((left, right) {
-            return _compareVersionNames(
-              _lastPathSegment(right.path),
-              _lastPathSegment(left.path),
-            );
-          });
+    final List<Directory> versions;
+    try {
+      versions = buildToolsDirectory.listSync().whereType<Directory>().toList()
+        ..sort((left, right) {
+          return _compareVersionNames(
+            _lastPathSegment(right.path),
+            _lastPathSegment(left.path),
+          );
+        });
+    } on FileSystemException {
+      return null;
+    }
 
     for (final version in versions) {
       for (final candidateName in _buildToolExecutableNames(executableName)) {
         final candidatePath = _joinPath(version.path, candidateName);
-        if (File(candidatePath).existsSync()) {
+        if (_fileExistsSafely(candidatePath)) {
           return candidatePath;
         }
       }
     }
 
     return null;
+  }
+
+  bool _directoryExistsSafely(String path) {
+    try {
+      return Directory(path).existsSync();
+    } on FileSystemException {
+      return false;
+    }
+  }
+
+  bool _fileExistsSafely(String path) {
+    try {
+      return File(path).existsSync();
+    } on FileSystemException {
+      return false;
+    }
   }
 
   Iterable<String> _buildToolExecutableNames(String executableName) {
