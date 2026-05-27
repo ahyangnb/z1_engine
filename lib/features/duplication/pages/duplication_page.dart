@@ -14,7 +14,7 @@ class DuplicationPage extends StatelessWidget {
 
     return SectionPanel(
       title: '重复度',
-      subtitle: '选择两个 APK 包后执行基础资源重复度检测。',
+      subtitle: '选择两个 APK 包后，真实解包并执行文件 MD5 重复度对比。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -132,29 +132,28 @@ class _DuplicationScopePanel extends StatelessWidget {
           _ScopeChip(
             icon: Icons.folder_copy_outlined,
             label: '资源文件结构',
-            stateLabel: '基础',
-            active: true,
+            stateLabel: '暂不支持',
           ),
           _ScopeChip(
             icon: Icons.fingerprint_outlined,
             label: '文件 MD5',
-            stateLabel: '基础',
+            stateLabel: '已支持',
             active: true,
           ),
           _ScopeChip(
             icon: Icons.data_object_outlined,
             label: 'dex 内部形态',
-            stateLabel: '深入预留',
+            stateLabel: '暂不支持',
           ),
           _ScopeChip(
             icon: Icons.image_search_outlined,
             label: 'png 内部元素',
-            stateLabel: '深入预留',
+            stateLabel: '暂不支持',
           ),
           _ScopeChip(
             icon: Icons.account_tree_outlined,
             label: 'smali / class 特征',
-            stateLabel: '深入预留',
+            stateLabel: '暂不支持',
           ),
         ],
       ),

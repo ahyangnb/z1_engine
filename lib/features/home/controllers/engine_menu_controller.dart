@@ -4,32 +4,50 @@ import 'package:flutter/foundation.dart';
 import 'package:z1_engine/core/models/android_signing_config.dart';
 import 'package:z1_engine/core/models/main_menu.dart';
 import 'package:z1_engine/core/models/package_target.dart';
+import 'package:z1_engine/core/services/apk_channel_package_service.dart';
+import 'package:z1_engine/core/services/apk_hardening_service.dart';
+import 'package:z1_engine/core/services/apk_md5_duplication_service.dart';
 import 'package:z1_engine/core/services/android_so_hardening_service.dart';
 
 class EngineMenuController extends ChangeNotifier {
+  final ApkHardeningService _apkHardeningService = ApkHardeningService();
   final AndroidSoHardeningService _androidSoHardeningService =
       AndroidSoHardeningService();
+  final ApkChannelPackageService _apkChannelPackageService =
+      ApkChannelPackageService();
+  final ApkMd5DuplicationService _apkMd5DuplicationService =
+      ApkMd5DuplicationService();
   MainMenu _selectedMenu = MainMenu.obfuscation;
   PackageTarget _selectedObfuscationTarget = PackageTarget.android;
   PackageTarget _selectedPackageTarget = PackageTarget.android;
   String _obfuscationProjectPath = '';
   String _packageProjectPath = '';
   String _protectProjectPath = '';
+  String _protectApkPath = '';
+  String _protectOutputPath = '';
   final Set<String> _androidObfuscationConfig = {};
   final Set<String> _flutterObfuscationConfig = {};
   final List<String> _obfuscationLogs = [];
   final List<AndroidSigningConfig> _androidSigningConfigs = [];
   final List<String> _signingLogs = [];
+  final List<String> _channelPackageLogs = [];
   final List<String> _hardeningLogs = [];
   final List<String> _duplicationLogs = [];
   final List<String> _packageSecurityLogs = [];
   String? _selectedSigningConfigId;
   String _signingApkPath = '';
   String _signingOutputPath = '';
+  String _channelPackageApkPath = '';
+  String _channelPackageOutputDirectory = '';
+  String _channelPackagePrefix = 'ch';
+  int _channelPackageCount = 10;
+  int _channelPackageStartIndex = 1;
   String _duplicationFirstApkPath = '';
   String _duplicationSecondApkPath = '';
   String _packageSecurityApkPath = '';
   bool _isSigning = false;
+  bool _isHardeningApk = false;
+  bool _isGeneratingChannelPackages = false;
   bool _isApplyingNativeHardening = false;
   bool _isComparingDuplication = false;
   bool _isCheckingPackageSecurity = false;
@@ -40,28 +58,40 @@ class EngineMenuController extends ChangeNotifier {
   String get obfuscationProjectPath => _obfuscationProjectPath;
   String get packageProjectPath => _packageProjectPath;
   String get protectProjectPath => _protectProjectPath;
+  String get protectApkPath => _protectApkPath;
+  String get protectOutputPath => _protectOutputPath;
   bool get hasObfuscationProjectPath =>
       _obfuscationProjectPath.trim().isNotEmpty;
   bool get hasPackageProjectPath => _packageProjectPath.trim().isNotEmpty;
   bool get hasProtectProjectPath => _protectProjectPath.trim().isNotEmpty;
+  bool get hasProtectApkPath => _protectApkPath.trim().isNotEmpty;
   List<String> get obfuscationLogs => List.unmodifiable(_obfuscationLogs);
   List<AndroidSigningConfig> get androidSigningConfigs =>
       List.unmodifiable(_androidSigningConfigs);
   List<String> get signingLogs => List.unmodifiable(_signingLogs);
+  List<String> get channelPackageLogs => List.unmodifiable(_channelPackageLogs);
   List<String> get hardeningLogs => List.unmodifiable(_hardeningLogs);
   List<String> get duplicationLogs => List.unmodifiable(_duplicationLogs);
   List<String> get packageSecurityLogs =>
       List.unmodifiable(_packageSecurityLogs);
   String get signingApkPath => _signingApkPath;
   String get signingOutputPath => _signingOutputPath;
+  String get channelPackageApkPath => _channelPackageApkPath;
+  String get channelPackageOutputDirectory => _channelPackageOutputDirectory;
+  String get channelPackagePrefix => _channelPackagePrefix;
+  int get channelPackageCount => _channelPackageCount;
+  int get channelPackageStartIndex => _channelPackageStartIndex;
   String get duplicationFirstApkPath => _duplicationFirstApkPath;
   String get duplicationSecondApkPath => _duplicationSecondApkPath;
   String get packageSecurityApkPath => _packageSecurityApkPath;
   bool get isSigning => _isSigning;
+  bool get isHardeningApk => _isHardeningApk;
+  bool get isGeneratingChannelPackages => _isGeneratingChannelPackages;
   bool get isApplyingNativeHardening => _isApplyingNativeHardening;
   bool get isComparingDuplication => _isComparingDuplication;
   bool get isCheckingPackageSecurity => _isCheckingPackageSecurity;
   bool get hasSigningApkPath => _signingApkPath.trim().isNotEmpty;
+  bool get hasChannelPackageApkPath => _channelPackageApkPath.trim().isNotEmpty;
   bool get hasDuplicationFirstApkPath =>
       _duplicationFirstApkPath.trim().isNotEmpty;
   bool get hasDuplicationSecondApkPath =>
@@ -85,8 +115,25 @@ class EngineMenuController extends ChangeNotifier {
     return !_isSigning && selectedSigningConfig != null && hasSigningApkPath;
   }
 
+  bool get canGenerateChannelPackages {
+    return !_isGeneratingChannelPackages &&
+        hasChannelPackageApkPath &&
+        _isApkPath(_channelPackageApkPath.trim()) &&
+        _channelPackageCount > 0 &&
+        _channelPackageStartIndex > 0 &&
+        _isSafeChannelPart(_channelPackagePrefix.trim());
+  }
+
   bool get canApplyAndroidSoHardening {
     return !_isApplyingNativeHardening && hasProtectProjectPath;
+  }
+
+  bool get canExecuteApkHardening {
+    return !_isHardeningApk &&
+        selectedSigningConfig != null &&
+        hasProtectApkPath &&
+        _isApkPath(_protectApkPath.trim()) &&
+        _effectiveProtectOutputPath.trim().isNotEmpty;
   }
 
   bool get canExecuteDuplicationCompare {
@@ -125,6 +172,32 @@ class EngineMenuController extends ChangeNotifier {
         _buildVerifyArgs(outputPath),
       ),
     ].join('\n');
+  }
+
+  String get channelPackagePreview {
+    final apkPath = _channelPackageApkPath.trim();
+    if (apkPath.isEmpty) {
+      return '上传已签名 APK 后预览输出文件名。';
+    }
+    if (_channelPackageCount <= 0) {
+      return '请输入大于 0 的生成数量。';
+    }
+    if (!_isSafeChannelPart(_channelPackagePrefix.trim())) {
+      return '渠道后缀仅支持字母、数字、点、下划线和短横线。';
+    }
+
+    final visibleCount = _channelPackageCount < 5 ? _channelPackageCount : 5;
+    final outputDirectory = _effectiveChannelPackageOutputDirectory;
+    final previewPaths = List.generate(visibleCount, (index) {
+      final channelCode = _channelCodeAt(index);
+      return _channelPackageOutputPath(apkPath, outputDirectory, channelCode);
+    });
+
+    if (_channelPackageCount > visibleCount) {
+      previewPaths.add('... 共 $_channelPackageCount 个渠道包');
+    }
+
+    return previewPaths.join('\n');
   }
 
   String get selectedObfuscationTargetLabel {
@@ -189,6 +262,34 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     _protectProjectPath = normalizedPath;
+    notifyListeners();
+  }
+
+  void updateProtectApkPath(String path) {
+    final normalizedPath = path.trim();
+    if (_protectApkPath == normalizedPath) {
+      return;
+    }
+
+    final previousDefaultOutputPath = _defaultHardenedApkPath(_protectApkPath);
+    final shouldRefreshOutputPath =
+        _protectOutputPath.trim().isEmpty ||
+        _protectOutputPath == previousDefaultOutputPath;
+
+    _protectApkPath = normalizedPath;
+    if (shouldRefreshOutputPath) {
+      _protectOutputPath = _defaultHardenedApkPath(normalizedPath);
+    }
+    notifyListeners();
+  }
+
+  void updateProtectOutputPath(String path) {
+    final normalizedPath = path.trim();
+    if (_protectOutputPath == normalizedPath) {
+      return;
+    }
+
+    _protectOutputPath = normalizedPath;
     notifyListeners();
   }
 
@@ -277,6 +378,68 @@ class EngineMenuController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void updateChannelPackageApkPath(String path) {
+    final normalizedPath = path.trim();
+    if (_channelPackageApkPath == normalizedPath) {
+      return;
+    }
+
+    final previousDefaultOutputDirectory = _defaultChannelOutputDirectory(
+      _channelPackageApkPath,
+    );
+    final shouldRefreshOutputDirectory =
+        _channelPackageOutputDirectory.trim().isEmpty ||
+        _channelPackageOutputDirectory == previousDefaultOutputDirectory;
+
+    _channelPackageApkPath = normalizedPath;
+    if (shouldRefreshOutputDirectory) {
+      _channelPackageOutputDirectory = _defaultChannelOutputDirectory(
+        normalizedPath,
+      );
+    }
+    notifyListeners();
+  }
+
+  void updateChannelPackageOutputDirectory(String path) {
+    final normalizedPath = path.trim();
+    if (_channelPackageOutputDirectory == normalizedPath) {
+      return;
+    }
+
+    _channelPackageOutputDirectory = normalizedPath;
+    notifyListeners();
+  }
+
+  void updateChannelPackagePrefix(String prefix) {
+    final normalizedPrefix = prefix.trim();
+    if (_channelPackagePrefix == normalizedPrefix) {
+      return;
+    }
+
+    _channelPackagePrefix = normalizedPrefix;
+    notifyListeners();
+  }
+
+  void updateChannelPackageCount(String count) {
+    final parsedCount = int.tryParse(count.trim()) ?? 0;
+    if (_channelPackageCount == parsedCount) {
+      return;
+    }
+
+    _channelPackageCount = parsedCount;
+    notifyListeners();
+  }
+
+  void updateChannelPackageStartIndex(String startIndex) {
+    final parsedStartIndex = int.tryParse(startIndex.trim()) ?? 0;
+    if (_channelPackageStartIndex == parsedStartIndex) {
+      return;
+    }
+
+    _channelPackageStartIndex = parsedStartIndex;
+    notifyListeners();
+  }
+
   void updateDuplicationFirstApkPath(String path) {
     final normalizedPath = path.trim();
     if (_duplicationFirstApkPath == normalizedPath) {
@@ -337,6 +500,81 @@ class EngineMenuController extends ChangeNotifier {
       '[${_timestamp()}] $targetLabel流程结束',
     ]);
     notifyListeners();
+  }
+
+  Future<void> executeApkHardening() async {
+    if (_isHardeningApk) {
+      return;
+    }
+
+    final config = selectedSigningConfig;
+    final apkPath = _protectApkPath.trim();
+    final outputPath = _effectiveProtectOutputPath;
+    if (apkPath.isEmpty) {
+      _hardeningLogs.add('[${_timestamp()}] 请先上传需要加固的 APK');
+      notifyListeners();
+      return;
+    }
+    if (!_isApkPath(apkPath)) {
+      _hardeningLogs.add('[${_timestamp()}] 当前加固流程仅支持 APK 文件');
+      notifyListeners();
+      return;
+    }
+    if (!File(apkPath).existsSync()) {
+      _hardeningLogs.add('[${_timestamp()}] APK 文件不存在：$apkPath');
+      notifyListeners();
+      return;
+    }
+    if (config == null) {
+      _hardeningLogs.add('[${_timestamp()}] 请先在“签名”页面添加并选择签名配置');
+      notifyListeners();
+      return;
+    }
+    if (outputPath.trim().isEmpty) {
+      _hardeningLogs.add('[${_timestamp()}] 输出 APK 路径为空');
+      notifyListeners();
+      return;
+    }
+    if (apkPath == outputPath) {
+      _hardeningLogs.add('[${_timestamp()}] 输出路径不能与原 APK 相同');
+      notifyListeners();
+      return;
+    }
+
+    _isHardeningApk = true;
+    _hardeningLogs.addAll([
+      '[${_timestamp()}] 开始 APK 防注入加固',
+      '[${_timestamp()}] 输入 APK：$apkPath',
+      '[${_timestamp()}] 输出 APK：$outputPath',
+      '[${_timestamp()}] 签名配置：${config.name}',
+    ]);
+    notifyListeners();
+
+    try {
+      final result = await _apkHardeningService.harden(
+        sourceApkPath: apkPath,
+        outputApkPath: outputPath,
+        signingConfig: config,
+      );
+      for (final log in result.logs) {
+        _hardeningLogs.add('[${_timestamp()}] $log');
+      }
+      _hardeningLogs.addAll([
+        '[${_timestamp()}] 已注入早启动防护 Provider：com.z1.guard.Z1GuardProvider',
+        '[${_timestamp()}] 已启用检测：私有目录二进制/DEX/JS、Frida/Gadget、TracerPid、异常线程、root 信号、VPN transport',
+        '[${_timestamp()}] 加固成功：${result.outputApkPath}',
+      ]);
+    } on ApkHardeningException catch (error) {
+      _hardeningLogs.add('[${_timestamp()}] 加固失败：${error.message}');
+    } on FileSystemException catch (error) {
+      _hardeningLogs.add('[${_timestamp()}] 文件处理失败：${error.message}');
+    } on ProcessException catch (error) {
+      _hardeningLogs.add('[${_timestamp()}] 命令启动失败：${error.message}');
+    } finally {
+      _isHardeningApk = false;
+      _hardeningLogs.add('[${_timestamp()}] APK 防注入加固流程结束');
+      notifyListeners();
+    }
   }
 
   Future<void> executeAndroidSoHardening() async {
@@ -522,6 +760,120 @@ class EngineMenuController extends ChangeNotifier {
     }
   }
 
+  Future<void> executeChannelPackageGeneration() async {
+    if (_isGeneratingChannelPackages) {
+      return;
+    }
+
+    final apkPath = _channelPackageApkPath.trim();
+    final outputDirectory = _effectiveChannelPackageOutputDirectory;
+    final channelPrefix = _channelPackagePrefix.trim();
+    if (apkPath.isEmpty) {
+      _channelPackageLogs.add('[${_timestamp()}] 请先上传已签名 APK 母包');
+      notifyListeners();
+      return;
+    }
+    if (!_isApkPath(apkPath)) {
+      _channelPackageLogs.add('[${_timestamp()}] 当前仅允许处理 APK 文件，请确认后缀为 .apk');
+      notifyListeners();
+      return;
+    }
+    if (!File(apkPath).existsSync()) {
+      _channelPackageLogs.add('[${_timestamp()}] 母包文件不存在：$apkPath');
+      notifyListeners();
+      return;
+    }
+    if (_channelPackageCount <= 0) {
+      _channelPackageLogs.add('[${_timestamp()}] 生成数量必须大于 0');
+      notifyListeners();
+      return;
+    }
+    if (_channelPackageCount > 10000) {
+      _channelPackageLogs.add('[${_timestamp()}] 单次最多生成 10000 个渠道包');
+      notifyListeners();
+      return;
+    }
+    if (_channelPackageStartIndex <= 0) {
+      _channelPackageLogs.add('[${_timestamp()}] 起始序号必须大于 0');
+      notifyListeners();
+      return;
+    }
+    if (!_isSafeChannelPart(channelPrefix)) {
+      _channelPackageLogs.add('[${_timestamp()}] 渠道后缀仅支持字母、数字、点、下划线和短横线');
+      notifyListeners();
+      return;
+    }
+    if (outputDirectory.isEmpty) {
+      _channelPackageLogs.add('[${_timestamp()}] 输出目录不能为空');
+      notifyListeners();
+      return;
+    }
+
+    _isGeneratingChannelPackages = true;
+    _channelPackageLogs.addAll([
+      '[${_timestamp()}] 开始批量生成渠道包',
+      '[${_timestamp()}] 母包：$apkPath',
+      '[${_timestamp()}] 输出目录：$outputDirectory',
+      '[${_timestamp()}] 渠道块 ID：0x${ApkChannelPackageService.defaultChannelBlockId.toRadixString(16)}',
+      '[${_timestamp()}] 生成数量：$_channelPackageCount',
+    ]);
+    notifyListeners();
+
+    try {
+      final apksignerExecutable = await _resolveBuildToolExecutable(
+        configuredExecutable: '',
+        executableName: 'apksigner',
+      );
+      var successCount = 0;
+
+      for (var index = 0; index < _channelPackageCount; index += 1) {
+        final channelCode = _channelCodeAt(index);
+        final outputPath = _channelPackageOutputPath(
+          apkPath,
+          outputDirectory,
+          channelCode,
+        );
+
+        _channelPackageLogs.add(
+          '[${_timestamp()}] 写入渠道码 $channelCode：$outputPath',
+        );
+        notifyListeners();
+
+        final result = await _apkChannelPackageService.generate(
+          sourceApkPath: apkPath,
+          outputApkPath: outputPath,
+          channelCode: channelCode,
+        );
+        final fileSizeMb = result.fileSizeBytes / 1024 / 1024;
+        _channelPackageLogs.add(
+          '[${_timestamp()}] 已生成：${result.channelCode}，${fileSizeMb.toStringAsFixed(2)} MB',
+        );
+
+        final verified = await _verifyApkSignature(
+          apksignerExecutable,
+          outputPath,
+          _channelPackageLogs,
+        );
+        if (!verified) {
+          return;
+        }
+
+        successCount += 1;
+      }
+
+      _channelPackageLogs.add(
+        '[${_timestamp()}] 渠道包生成完成，成功 $successCount / $_channelPackageCount',
+      );
+    } on ApkChannelPackageException catch (error) {
+      _channelPackageLogs.add('[${_timestamp()}] 渠道包生成失败：${error.message}');
+    } on FileSystemException catch (error) {
+      _channelPackageLogs.add('[${_timestamp()}] 文件处理失败：${error.message}');
+    } finally {
+      _isGeneratingChannelPackages = false;
+      notifyListeners();
+    }
+  }
+
   Future<void> executeApkDuplicationCompare() async {
     if (_isComparingDuplication) {
       return;
@@ -547,37 +899,42 @@ class EngineMenuController extends ChangeNotifier {
       return;
     }
 
+    final missingPaths = [
+      if (!File(firstApkPath).existsSync()) 'APK A 不存在：$firstApkPath',
+      if (!File(secondApkPath).existsSync()) 'APK B 不存在：$secondApkPath',
+    ];
+    if (missingPaths.isNotEmpty) {
+      for (final missingPath in missingPaths) {
+        _duplicationLogs.add('[${_timestamp()}] $missingPath');
+      }
+      notifyListeners();
+      return;
+    }
+
     _isComparingDuplication = true;
     _duplicationLogs.addAll([
       '[${_timestamp()}] 开始 APK 重复度检测',
       '[${_timestamp()}] APK A：$firstApkPath',
       '[${_timestamp()}] APK B：$secondApkPath',
-      '[${_timestamp()}] 检测范围：资源文件结构、文件 MD5、重复/新增/缺失资源清单',
-      '[${_timestamp()}] 预留深度能力：dex 内部形态、png 内部元素、smali、class 特征、代码层级关系',
+      '[${_timestamp()}] 当前执行能力：真实解包后计算文件 MD5 并对比',
+      '[${_timestamp()}] 暂不支持：资源文件结构、dex 内部形态、png 内部元素、smali / class 特征、代码层级关系',
     ]);
     notifyListeners();
 
     try {
-      await Future<void>.delayed(const Duration(milliseconds: 240));
+      _duplicationLogs.add('[${_timestamp()}] 正在解包 APK 并计算文件 MD5');
+      notifyListeners();
 
-      final missingPaths = [
-        if (!File(firstApkPath).existsSync()) 'APK A 不存在',
-        if (!File(secondApkPath).existsSync()) 'APK B 不存在',
-      ];
-      if (missingPaths.isNotEmpty) {
-        _duplicationLogs.add(
-          '[${_timestamp()}] ${missingPaths.join('，')}，内核执行前会停止解包',
-        );
-      } else {
-        _duplicationLogs.addAll([
-          '[${_timestamp()}] 基础 UI 流程已就绪，后续接入 apktool/jadx 后执行真实解包',
-          '[${_timestamp()}] 当前版本暂不生成重复度报告',
-        ]);
-      }
-
-      _duplicationLogs.add('[${_timestamp()}] APK 重复度检测流程结束');
+      final result = await _apkMd5DuplicationService.compare(
+        firstApkPath: firstApkPath,
+        secondApkPath: secondApkPath,
+      );
+      _appendDuplicationResultLogs(result);
+    } on ApkMd5DuplicationException catch (error) {
+      _duplicationLogs.add('[${_timestamp()}] APK 重复度检测失败：${error.message}');
     } finally {
       _isComparingDuplication = false;
+      _duplicationLogs.add('[${_timestamp()}] APK 重复度检测流程结束');
       notifyListeners();
     }
   }
@@ -647,6 +1004,15 @@ class EngineMenuController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void clearChannelPackageLogs() {
+    if (_channelPackageLogs.isEmpty) {
+      return;
+    }
+
+    _channelPackageLogs.clear();
+    notifyListeners();
+  }
+
   void clearHardeningLogs() {
     if (_hardeningLogs.isEmpty) {
       return;
@@ -691,6 +1057,24 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     return _defaultSignedApkPath(_signingApkPath.trim());
+  }
+
+  String get _effectiveProtectOutputPath {
+    final normalizedOutputPath = _protectOutputPath.trim();
+    if (normalizedOutputPath.isNotEmpty) {
+      return normalizedOutputPath;
+    }
+
+    return _defaultHardenedApkPath(_protectApkPath.trim());
+  }
+
+  String get _effectiveChannelPackageOutputDirectory {
+    final normalizedOutputDirectory = _channelPackageOutputDirectory.trim();
+    if (normalizedOutputDirectory.isNotEmpty) {
+      return normalizedOutputDirectory;
+    }
+
+    return _defaultChannelOutputDirectory(_channelPackageApkPath.trim());
   }
 
   List<String> _buildSigningArgs(
@@ -754,15 +1138,132 @@ class EngineMenuController extends ChangeNotifier {
     return ['verify', '--verbose', '--print-certs', outputPath];
   }
 
+  Future<bool> _verifyApkSignature(
+    String apksignerExecutable,
+    String outputPath,
+    List<String> logs,
+  ) async {
+    final verifyArgs = _buildVerifyArgs(outputPath);
+    logs.add(
+      '[${_timestamp()}] verify：${_formatCommand(apksignerExecutable, verifyArgs)}',
+    );
+    notifyListeners();
+
+    try {
+      final verifyResult = await Process.run(
+        apksignerExecutable,
+        verifyArgs,
+        runInShell: Platform.isWindows,
+      );
+      _appendProcessOutputTo(logs, verifyResult);
+      if (verifyResult.exitCode != 0) {
+        logs.add('[${_timestamp()}] 签名校验失败，退出码：${verifyResult.exitCode}');
+        return false;
+      }
+
+      logs.add('[${_timestamp()}] 签名校验通过：$outputPath');
+      return true;
+    } on ProcessException catch (error) {
+      logs.add('[${_timestamp()}] 签名校验命令启动失败：${error.message}');
+      return false;
+    }
+  }
+
   void _appendProcessOutput(ProcessResult result) {
+    _appendProcessOutputTo(_signingLogs, result);
+  }
+
+  void _appendProcessOutputTo(List<String> logs, ProcessResult result) {
     final stdoutText = result.stdout.toString().trim();
     final stderrText = result.stderr.toString().trim();
     if (stdoutText.isNotEmpty) {
-      _signingLogs.add(stdoutText);
+      logs.add(stdoutText);
     }
     if (stderrText.isNotEmpty) {
-      _signingLogs.add(stderrText);
+      logs.add(stderrText);
     }
+  }
+
+  void _appendDuplicationResultLogs(ApkMd5DuplicationResult result) {
+    final first = result.firstSnapshot;
+    final second = result.secondSnapshot;
+
+    _duplicationLogs.addAll([
+      '[${_timestamp()}] APK A 文件：${first.fileCount} 个，唯一 MD5：${first.uniqueMd5Count}，总大小：${_formatFileSize(first.totalSizeBytes)}',
+      '[${_timestamp()}] APK B 文件：${second.fileCount} 个，唯一 MD5：${second.uniqueMd5Count}，总大小：${_formatFileSize(second.totalSizeBytes)}',
+      '[${_timestamp()}] 文件 MD5 重复度：${_formatPercent(result.md5Similarity)}（命中 ${result.matchedMd5FileCount} / 联合 ${result.md5UnionFileCount}）',
+      '[${_timestamp()}] APK A MD5 覆盖：${_formatPercent(result.firstCoverage)}；APK B MD5 覆盖：${_formatPercent(result.secondCoverage)}',
+      '[${_timestamp()}] 同路径文件：${result.commonPathCount}；同路径同 MD5：${result.samePathSameMd5Count}；同路径 MD5 不同：${result.samePathChangedMd5Count}',
+      '[${_timestamp()}] APK A 独有 MD5 文件：${result.firstOnlyMd5FileCount}；APK B 独有 MD5 文件：${result.secondOnlyMd5FileCount}',
+    ]);
+
+    _appendMatchedMd5Samples(result.matchedSamples);
+    _appendSingleApkMd5Samples('APK A 独有 MD5 样例', result.firstOnlySamples);
+    _appendSingleApkMd5Samples('APK B 独有 MD5 样例', result.secondOnlySamples);
+    _appendChangedPathMd5Samples(result.changedPathSamples);
+  }
+
+  void _appendMatchedMd5Samples(List<ApkMd5MatchSample> samples) {
+    if (samples.isEmpty) {
+      return;
+    }
+
+    _duplicationLogs.add('[${_timestamp()}] MD5 命中样例：');
+    for (final sample in samples) {
+      _duplicationLogs.add(
+        '  ${_shortMd5(sample.md5)} | ${_formatFileSize(sample.sizeBytes)} | A: ${sample.firstPath} | B: ${sample.secondPath}',
+      );
+    }
+  }
+
+  void _appendSingleApkMd5Samples(String title, List<ApkFileMd5> samples) {
+    if (samples.isEmpty) {
+      return;
+    }
+
+    _duplicationLogs.add('[${_timestamp()}] $title：');
+    for (final sample in samples) {
+      _duplicationLogs.add(
+        '  ${_shortMd5(sample.md5)} | ${_formatFileSize(sample.sizeBytes)} | ${sample.path}',
+      );
+    }
+  }
+
+  void _appendChangedPathMd5Samples(List<ApkSamePathMd5Pair> samples) {
+    if (samples.isEmpty) {
+      return;
+    }
+
+    _duplicationLogs.add('[${_timestamp()}] 同路径 MD5 不同样例：');
+    for (final sample in samples) {
+      _duplicationLogs.add(
+        '  ${sample.path} | A: ${_shortMd5(sample.firstMd5)} | B: ${_shortMd5(sample.secondMd5)}',
+      );
+    }
+  }
+
+  String _formatPercent(double value) {
+    return '${(value * 100).toStringAsFixed(2)}%';
+  }
+
+  String _formatFileSize(int bytes) {
+    const units = ['B', 'KB', 'MB', 'GB'];
+    var size = bytes.toDouble();
+    var unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+
+    if (unitIndex == 0) {
+      return '$bytes ${units[unitIndex]}';
+    }
+
+    return '${size.toStringAsFixed(2)} ${units[unitIndex]}';
+  }
+
+  String _shortMd5(String value) {
+    return value.length <= 8 ? value : value.substring(0, 8);
   }
 
   String _defaultSignedApkPath(String apkPath) {
@@ -789,6 +1290,80 @@ class EngineMenuController extends ChangeNotifier {
     return '$directory${baseName}_signed.apk';
   }
 
+  String _defaultHardenedApkPath(String apkPath) {
+    if (apkPath.isEmpty) {
+      return '';
+    }
+
+    final slashIndex = apkPath.lastIndexOf('/');
+    final backslashIndex = apkPath.lastIndexOf(r'\');
+    final separatorIndex = slashIndex > backslashIndex
+        ? slashIndex
+        : backslashIndex;
+    final directory = separatorIndex >= 0
+        ? apkPath.substring(0, separatorIndex + 1)
+        : '';
+    final fileName = separatorIndex >= 0
+        ? apkPath.substring(separatorIndex + 1)
+        : apkPath;
+    final lowerFileName = fileName.toLowerCase();
+    final baseName = lowerFileName.endsWith('.apk')
+        ? fileName.substring(0, fileName.length - 4)
+        : fileName;
+
+    return '$directory${baseName}_z1guard.apk';
+  }
+
+  String _defaultChannelOutputDirectory(String apkPath) {
+    if (apkPath.trim().isEmpty) {
+      return '';
+    }
+
+    final directory = _directoryOfPath(apkPath);
+    if (directory.isEmpty) {
+      return 'channel_packages';
+    }
+
+    return _joinPath(directory, 'channel_packages');
+  }
+
+  String _channelCodeAt(int zeroBasedIndex) {
+    final currentIndex = _channelPackageStartIndex + zeroBasedIndex;
+    final maxIndex = _channelPackageStartIndex + _channelPackageCount - 1;
+    final width = maxIndex.toString().length > 3
+        ? maxIndex.toString().length
+        : 3;
+
+    return '${_channelPackagePrefix.trim()}${currentIndex.toString().padLeft(width, '0')}';
+  }
+
+  String _channelPackageOutputPath(
+    String apkPath,
+    String outputDirectory,
+    String channelCode,
+  ) {
+    final baseName = _fileNameWithoutApkExtension(apkPath);
+    final fileName = '${baseName}_$channelCode.apk';
+    return _joinPath(outputDirectory, fileName);
+  }
+
+  String _directoryOfPath(String path) {
+    final slashIndex = path.lastIndexOf('/');
+    final backslashIndex = path.lastIndexOf(r'\');
+    final separatorIndex = slashIndex > backslashIndex
+        ? slashIndex
+        : backslashIndex;
+
+    return separatorIndex >= 0 ? path.substring(0, separatorIndex) : '';
+  }
+
+  String _fileNameWithoutApkExtension(String path) {
+    final fileName = _lastPathSegment(path);
+    return fileName.toLowerCase().endsWith('.apk')
+        ? fileName.substring(0, fileName.length - 4)
+        : fileName;
+  }
+
   String _previewAlignedApkPath(String outputPath) {
     return '${_withoutApkExtension(outputPath)}_aligned.tmp.apk';
   }
@@ -806,6 +1381,10 @@ class EngineMenuController extends ChangeNotifier {
 
   bool _isApkPath(String path) {
     return path.toLowerCase().endsWith('.apk');
+  }
+
+  bool _isSafeChannelPart(String value) {
+    return RegExp(r'^[A-Za-z0-9._-]+$').hasMatch(value);
   }
 
   Future<String> _resolveBuildToolExecutable({

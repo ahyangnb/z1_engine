@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:z1_engine/core/models/main_menu.dart';
+import 'package:z1_engine/features/channel_package/pages/channel_package_page.dart';
 import 'package:z1_engine/features/duplication/pages/duplication_page.dart';
 import 'package:z1_engine/features/home/controllers/engine_menu_controller.dart';
 import 'package:z1_engine/features/home/widgets/top_menu_bar.dart';
 import 'package:z1_engine/features/obfuscation/pages/obfuscation_page.dart';
 import 'package:z1_engine/features/package/pages/package_page.dart';
-import 'package:z1_engine/features/package_security/pages/package_security_page.dart';
+// import 'package:z1_engine/features/package_security/pages/package_security_page.dart';
 import 'package:z1_engine/features/protect/pages/protect_page.dart';
 import 'package:z1_engine/features/sign/pages/sign_page.dart';
 import 'package:z1_engine/shared/widgets/placeholder_page.dart';
@@ -58,15 +59,11 @@ class _CurrentMenuContent extends StatelessWidget {
       case MainMenu.package:
         return const PackagePage();
       case MainMenu.channelPackage:
-        return const PlaceholderPage(
-          icon: Icons.sell_outlined,
-          title: '渠道包',
-          description: '渠道包界面预留，可继续接入母包上传、渠道配置、批量生成和产物导出。',
-        );
+        return const ChannelPackagePage();
       case MainMenu.sign:
         return const SignPage();
-      case MainMenu.packageSecurity:
-        return const PackageSecurityPage();
+      // case MainMenu.packageSecurity:
+      //   return const PackageSecurityPage();
       case MainMenu.protect:
         return const ProtectPage();
       case MainMenu.duplication:
