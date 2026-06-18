@@ -92,31 +92,56 @@ class _SigningConfigHeader extends StatelessWidget {
 }
 
 class _SigningConfigDialog extends StatefulWidget {
-  const _SigningConfigDialog();
+  const _SigningConfigDialog({this.config});
+
+  final AndroidSigningConfig? config;
 
   @override
   State<_SigningConfigDialog> createState() => _SigningConfigDialogState();
 }
 
 class _SigningConfigDialogState extends State<_SigningConfigDialog> {
-  final TextEditingController _aliasController = TextEditingController();
-  final TextEditingController _storePasswordController =
-      TextEditingController();
-  final TextEditingController _keyPasswordController = TextEditingController();
-  String _keystorePath = '';
-  AndroidSigningScheme _signingScheme = AndroidSigningScheme.v2;
+  late final TextEditingController _aliasController;
+  late final TextEditingController _storePasswordController;
+  late final TextEditingController _keyPasswordController;
+  late final TextEditingController _remarkController;
+  late String _keystorePath;
+  late AndroidSigningScheme _signingScheme;
+  bool _isSaving = false;
+  bool _showStorePassword = false;
+  bool _showKeyPassword = false;
+  OverlayEntry? _toastEntry;
 
   bool get _canAddConfig {
     return _keystorePath.trim().isNotEmpty &&
         _aliasController.text.trim().isNotEmpty &&
-        _storePasswordController.text.isNotEmpty;
+        (_storePasswordController.text.isNotEmpty ||
+            _keyPasswordController.text.isNotEmpty);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    final config = widget.config;
+    _aliasController = TextEditingController(text: config?.keyAlias ?? '');
+    _storePasswordController = TextEditingController(
+      text: config?.storePassword ?? '',
+    );
+    _keyPasswordController = TextEditingController(
+      text: config?.keyPassword ?? '',
+    );
+    _remarkController = TextEditingController(text: config?.remark ?? '');
+    _keystorePath = config?.keystorePath ?? '';
+    _signingScheme = config?.signingScheme ?? AndroidSigningScheme.v2;
   }
 
   @override
   void dispose() {
+    _toastEntry?.remove();
     _aliasController.dispose();
     _storePasswordController.dispose();
     _keyPasswordController.dispose();
+    _remarkController.dispose();
     super.dispose();
   }
 
@@ -124,26 +149,115 @@ class _SigningConfigDialogState extends State<_SigningConfigDialog> {
     setState(() {});
   }
 
-  void _addConfig() {
-    if (!_canAddConfig) {
+  Future<void> _saveConfig() async {
+    if (!_canAddConfig || _isSaving) {
       return;
     }
 
-    context.read<EngineMenuController>().addAndroidSigningConfig(
+    setState(() => _isSaving = true);
+    final controller = context.read<EngineMenuController>();
+    final config = widget.config;
+    final errorMessage = await controller.saveAndroidSigningConfig(
+      id: config?.id,
       keystorePath: _keystorePath,
       keyAlias: _aliasController.text,
       storePassword: _storePasswordController.text,
       keyPassword: _keyPasswordController.text,
       signingScheme: _signingScheme,
+      remark: _remarkController.text,
     );
+    if (!mounted) {
+      return;
+    }
 
+    setState(() => _isSaving = false);
+    if (errorMessage != null) {
+      _showDialogToast(errorMessage);
+      return;
+    }
     Navigator.of(context).pop();
+  }
+
+  void _showDialogToast(String message) {
+    _toastEntry?.remove();
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (context) {
+        return Positioned(
+          top: 48,
+          left: 24,
+          right: 24,
+          child: IgnorePointer(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: Material(
+                color: Colors.transparent,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 720),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1F2937),
+                      borderRadius: BorderRadius.circular(12),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.18),
+                          blurRadius: 20,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 12,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.error_outline_rounded,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 10),
+                          Flexible(
+                            child: Text(
+                              message,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                                height: 1.4,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    _toastEntry = entry;
+    Overlay.of(context, rootOverlay: true).insert(entry);
+    Future<void>.delayed(const Duration(seconds: 3), () {
+      if (!mounted || _toastEntry != entry) {
+        return;
+      }
+      entry.remove();
+      _toastEntry = null;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
+    final isEditing = widget.config != null;
+
     return AlertDialog(
-      title: const Text('添加签名'),
+      title: Text(isEditing ? '编辑签名' : '添加签名'),
       content: SizedBox(
         width: 720,
         child: SingleChildScrollView(
@@ -166,28 +280,68 @@ class _SigningConfigDialogState extends State<_SigningConfigDialog> {
                   ),
                   TextField(
                     controller: _storePasswordController,
-                    obscureText: true,
+                    obscureText: !_showStorePassword,
                     onChanged: (_) => _refresh(),
-                    decoration: const InputDecoration(
-                      labelText: '密钥库密码',
-                      hintText: 'store password',
-                      border: OutlineInputBorder(
+                    decoration: InputDecoration(
+                      labelText: '密钥库密码（可选）',
+                      hintText: '为空时自动尝试使用密钥密码',
+                      suffixIcon: IconButton(
+                        tooltip: _showStorePassword ? '隐藏密钥库密码' : '显示密钥库密码',
+                        icon: Icon(
+                          _showStorePassword
+                              ? Icons.visibility_off_outlined
+                              : Icons.visibility_outlined,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _showStorePassword = !_showStorePassword;
+                          });
+                        },
+                      ),
+                      border: const OutlineInputBorder(
                         borderRadius: BorderRadius.all(Radius.circular(8)),
                       ),
                     ),
                   ),
                   TextField(
                     controller: _keyPasswordController,
-                    obscureText: true,
-                    decoration: const InputDecoration(
+                    obscureText: !_showKeyPassword,
+                    onChanged: (_) => _refresh(),
+                    decoration: InputDecoration(
                       labelText: '密钥密码',
-                      hintText: '为空时默认使用密钥库密码',
-                      border: OutlineInputBorder(
+                      hintText: 'key password',
+                      suffixIcon: IconButton(
+                        tooltip: _showKeyPassword ? '隐藏密钥密码' : '显示密钥密码',
+                        icon: Icon(
+                          _showKeyPassword
+                              ? Icons.visibility_off_outlined
+                              : Icons.visibility_outlined,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _showKeyPassword = !_showKeyPassword;
+                          });
+                        },
+                      ),
+                      border: const OutlineInputBorder(
                         borderRadius: BorderRadius.all(Radius.circular(8)),
                       ),
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _remarkController,
+                minLines: 2,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  labelText: '备注',
+                  hintText: '例如：生产环境 / 测试环境 / 客户渠道签名',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.all(Radius.circular(8)),
+                  ),
+                ),
               ),
               const SizedBox(height: 16),
               _SigningSchemePicker(
@@ -202,10 +356,9 @@ class _SigningConfigDialogState extends State<_SigningConfigDialog> {
                 onChanged: (value) => setState(() => _keystorePath = value),
                 title: '',
                 label: '签名文件',
-                hint: '/release.jks 或 /release.keystore',
+                hint: '/release.jks、/release.keystore 或其他签名文件',
                 dropHint: '',
                 dialogTitle: '选择签名文件',
-                allowedExtensions: const ['jks', 'keystore'],
                 icon: Icons.vpn_key_outlined,
                 showDropTarget: false,
               ),
@@ -219,9 +372,21 @@ class _SigningConfigDialogState extends State<_SigningConfigDialog> {
           child: const Text('取消'),
         ),
         FilledButton.icon(
-          onPressed: _canAddConfig ? _addConfig : null,
-          icon: const Icon(Icons.add_outlined),
-          label: const Text('添加签名'),
+          onPressed: _canAddConfig && !_isSaving ? _saveConfig : null,
+          icon: Icon(
+            _isSaving
+                ? Icons.hourglass_top_outlined
+                : isEditing
+                ? Icons.save_outlined
+                : Icons.add_outlined,
+          ),
+          label: Text(
+            _isSaving
+                ? '校验中'
+                : isEditing
+                ? '保存'
+                : '添加签名',
+          ),
         ),
       ],
     );
@@ -271,6 +436,16 @@ class _SigningConfigList extends StatelessWidget {
 
   final EngineMenuController controller;
 
+  Future<void> _showEditDialog(
+    BuildContext context,
+    AndroidSigningConfig config,
+  ) {
+    return showDialog<void>(
+      context: context,
+      builder: (_) => _SigningConfigDialog(config: config),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final configs = controller.androidSigningConfigs;
@@ -302,6 +477,11 @@ class _SigningConfigList extends StatelessWidget {
       child: Column(
         children: configs.map((config) {
           final selected = controller.selectedSigningConfigId == config.id;
+          final subtitle = [
+            config.signingScheme.label,
+            if (config.remark.trim().isNotEmpty) '备注：${config.remark}',
+            config.keystorePath,
+          ].join('\n');
 
           return Padding(
             padding: const EdgeInsets.only(bottom: 10),
@@ -322,16 +502,26 @@ class _SigningConfigList extends StatelessWidget {
                   style: const TextStyle(fontWeight: FontWeight.w700),
                 ),
                 subtitle: Text(
-                  '${config.signingScheme.label}\n${config.keystorePath}',
-                  maxLines: 2,
+                  subtitle,
+                  maxLines: 3,
                   overflow: TextOverflow.ellipsis,
                 ),
-                secondary: IconButton(
-                  tooltip: '删除签名配置',
-                  onPressed: () => context
-                      .read<EngineMenuController>()
-                      .removeAndroidSigningConfig(config.id),
-                  icon: const Icon(Icons.delete_outline),
+                secondary: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: '编辑签名配置',
+                      onPressed: () => _showEditDialog(context, config),
+                      icon: const Icon(Icons.edit_outlined),
+                    ),
+                    IconButton(
+                      tooltip: '删除签名配置',
+                      onPressed: () => context
+                          .read<EngineMenuController>()
+                          .removeAndroidSigningConfig(config.id),
+                      icon: const Icon(Icons.delete_outline),
+                    ),
+                  ],
                 ),
               ),
             ),

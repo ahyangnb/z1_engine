@@ -1,15 +1,24 @@
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
 import 'package:z1_engine/core/models/android_signing_config.dart';
+import 'package:z1_engine/core/models/channel_package_config.dart';
 import 'package:z1_engine/core/models/main_menu.dart';
 import 'package:z1_engine/core/models/package_target.dart';
 import 'package:z1_engine/core/services/apk_channel_package_service.dart';
 import 'package:z1_engine/core/services/apk_hardening_service.dart';
 import 'package:z1_engine/core/services/apk_md5_duplication_service.dart';
 import 'package:z1_engine/core/services/android_so_hardening_service.dart';
+import 'package:z1_engine/core/services/channel_package_config_store.dart';
+import 'package:z1_engine/core/services/signing_config_store.dart';
 
 class EngineMenuController extends ChangeNotifier {
+  EngineMenuController() {
+    _loadSavedSigningConfigs();
+    _loadSavedChannelPackageConfig();
+  }
+
   final ApkHardeningService _apkHardeningService = ApkHardeningService();
   final AndroidSoHardeningService _androidSoHardeningService =
       AndroidSoHardeningService();
@@ -17,6 +26,9 @@ class EngineMenuController extends ChangeNotifier {
       ApkChannelPackageService();
   final ApkMd5DuplicationService _apkMd5DuplicationService =
       ApkMd5DuplicationService();
+  final SigningConfigStore _signingConfigStore = SigningConfigStore();
+  final ChannelPackageConfigStore _channelPackageConfigStore =
+      ChannelPackageConfigStore();
   MainMenu _selectedMenu = MainMenu.obfuscation;
   PackageTarget _selectedObfuscationTarget = PackageTarget.android;
   PackageTarget _selectedPackageTarget = PackageTarget.android;
@@ -299,6 +311,7 @@ class EngineMenuController extends ChangeNotifier {
     required String storePassword,
     required String keyPassword,
     required AndroidSigningScheme signingScheme,
+    String remark = '',
   }) {
     final normalizedAlias = keyAlias.trim();
     final config = AndroidSigningConfig(
@@ -308,13 +321,95 @@ class EngineMenuController extends ChangeNotifier {
       keyAlias: normalizedAlias,
       storePassword: storePassword,
       keyPassword: keyPassword,
+      remark: remark.trim(),
       signingScheme: signingScheme,
     );
 
     _androidSigningConfigs.add(config);
     _selectedSigningConfigId = config.id;
     _signingLogs.add('[${_timestamp()}] 已添加签名配置：${config.name}');
+    _saveSigningConfigs();
     notifyListeners();
+  }
+
+  void updateAndroidSigningConfig({
+    required String id,
+    required String keystorePath,
+    required String keyAlias,
+    required String storePassword,
+    required String keyPassword,
+    required AndroidSigningScheme signingScheme,
+    required String remark,
+  }) {
+    final index = _androidSigningConfigs.indexWhere(
+      (config) => config.id == id,
+    );
+    if (index < 0) {
+      return;
+    }
+
+    final normalizedAlias = keyAlias.trim();
+    final updatedConfig = _androidSigningConfigs[index].copyWith(
+      name: normalizedAlias,
+      keystorePath: keystorePath.trim(),
+      keyAlias: normalizedAlias,
+      storePassword: storePassword,
+      keyPassword: keyPassword,
+      remark: remark.trim(),
+      signingScheme: signingScheme,
+    );
+
+    _androidSigningConfigs[index] = updatedConfig;
+    _selectedSigningConfigId = updatedConfig.id;
+    _signingLogs.add('[${_timestamp()}] 已更新签名配置：${updatedConfig.name}');
+    _saveSigningConfigs();
+    notifyListeners();
+  }
+
+  Future<String?> saveAndroidSigningConfig({
+    required String? id,
+    required String keystorePath,
+    required String keyAlias,
+    required String storePassword,
+    required String keyPassword,
+    required AndroidSigningScheme signingScheme,
+    required String remark,
+  }) async {
+    final validationResult = await _validateAndroidSigningConfig(
+      keystorePath: keystorePath,
+      keyAlias: keyAlias,
+      storePassword: storePassword,
+      keyPassword: keyPassword,
+      signingScheme: signingScheme,
+    );
+    if (validationResult.errorMessage != null) {
+      _signingLogs.add('[${_timestamp()}] ${validationResult.errorMessage}');
+      notifyListeners();
+      return validationResult.errorMessage;
+    }
+
+    if (id == null) {
+      addAndroidSigningConfig(
+        keystorePath: keystorePath,
+        keyAlias: keyAlias,
+        storePassword: validationResult.storePassword,
+        keyPassword: validationResult.keyPassword,
+        signingScheme: signingScheme,
+        remark: remark,
+      );
+    } else {
+      updateAndroidSigningConfig(
+        id: id,
+        keystorePath: keystorePath,
+        keyAlias: keyAlias,
+        storePassword: validationResult.storePassword,
+        keyPassword: validationResult.keyPassword,
+        signingScheme: signingScheme,
+        remark: remark,
+      );
+    }
+
+    return null;
   }
 
   void selectAndroidSigningConfig(String id) {
@@ -323,6 +418,7 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     _selectedSigningConfigId = id;
+    _saveSigningConfigs();
     notifyListeners();
   }
 
@@ -347,6 +443,7 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     _signingLogs.add('[${_timestamp()}] 已移除签名配置：${removedConfig.name}');
+    _saveSigningConfigs();
     notifyListeners();
   }
 
@@ -407,6 +504,7 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     _channelPackageOutputDirectory = normalizedPath;
+    _saveChannelPackageConfig();
     notifyListeners();
   }
 
@@ -417,6 +515,9 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     _channelPackagePrefix = normalizedPrefix;
+    if (_isSafeChannelPart(normalizedPrefix)) {
+      _saveChannelPackageConfig();
+    }
     notifyListeners();
   }
 
@@ -427,6 +528,9 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     _channelPackageCount = parsedCount;
+    if (parsedCount > 0) {
+      _saveChannelPackageConfig();
+    }
     notifyListeners();
   }
 
@@ -437,6 +541,9 @@ class EngineMenuController extends ChangeNotifier {
     }
 
     _channelPackageStartIndex = parsedStartIndex;
+    if (parsedStartIndex > 0) {
+      _saveChannelPackageConfig();
+    }
     notifyListeners();
   }
 
@@ -1040,6 +1147,212 @@ class EngineMenuController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _loadSavedSigningConfigs() async {
+    try {
+      final snapshot = await _signingConfigStore.load();
+      if (snapshot.configs.isEmpty) {
+        return;
+      }
+
+      _androidSigningConfigs
+        ..clear()
+        ..addAll(snapshot.configs);
+      _selectedSigningConfigId = snapshot.selectedConfigId;
+      final selectedConfigExists = _androidSigningConfigs.any(
+        (config) => config.id == _selectedSigningConfigId,
+      );
+      if (!selectedConfigExists && _androidSigningConfigs.isNotEmpty) {
+        _selectedSigningConfigId = _androidSigningConfigs.first.id;
+      }
+      _signingLogs.add('[${_timestamp()}] 已加载本地签名配置');
+      notifyListeners();
+    } on FormatException catch (error) {
+      _signingLogs.add('[${_timestamp()}] 本地签名配置解析失败：${error.message}');
+      notifyListeners();
+    } on FileSystemException catch (error) {
+      _signingLogs.add('[${_timestamp()}] 本地签名配置读取失败：${error.message}');
+      notifyListeners();
+    }
+  }
+
+  Future<void> _saveSigningConfigs() async {
+    try {
+      await _signingConfigStore.save(
+        configs: _androidSigningConfigs,
+        selectedConfigId: _selectedSigningConfigId,
+      );
+    } on FileSystemException catch (error) {
+      _signingLogs.add('[${_timestamp()}] 本地签名配置保存失败：${error.message}');
+      notifyListeners();
+    }
+  }
+
+  Future<void> _loadSavedChannelPackageConfig() async {
+    try {
+      final config = await _channelPackageConfigStore.load();
+      _channelPackageOutputDirectory = config.outputDirectory.trim();
+      final normalizedPrefix = config.prefix.trim();
+      if (_isSafeChannelPart(normalizedPrefix)) {
+        _channelPackagePrefix = normalizedPrefix;
+      }
+      if (config.count > 0) {
+        _channelPackageCount = config.count;
+      }
+      if (config.startIndex > 0) {
+        _channelPackageStartIndex = config.startIndex;
+      }
+
+      _channelPackageLogs.add('[${_timestamp()}] 已加载本地渠道配置');
+      notifyListeners();
+    } on FormatException catch (error) {
+      _channelPackageLogs.add('[${_timestamp()}] 本地渠道配置解析失败：${error.message}');
+      notifyListeners();
+    } on FileSystemException catch (error) {
+      _channelPackageLogs.add('[${_timestamp()}] 本地渠道配置读取失败：${error.message}');
+      notifyListeners();
+    }
+  }
+
+  Future<void> _saveChannelPackageConfig() async {
+    try {
+      await _channelPackageConfigStore.save(
+        ChannelPackageConfig(
+          outputDirectory: _channelPackageOutputDirectory.trim(),
+          prefix: _channelPackagePrefix.trim(),
+          count: _channelPackageCount,
+          startIndex: _channelPackageStartIndex,
+        ),
+      );
+    } on FileSystemException catch (error) {
+      _channelPackageLogs.add('[${_timestamp()}] 本地渠道配置保存失败：${error.message}');
+      notifyListeners();
+    }
+  }
+
+  Future<_SigningConfigValidationResult> _validateAndroidSigningConfig({
+    required String keystorePath,
+    required String keyAlias,
+    required String storePassword,
+    required String keyPassword,
+    required AndroidSigningScheme signingScheme,
+  }) async {
+    final normalizedKeystorePath = keystorePath.trim();
+    final normalizedAlias = keyAlias.trim();
+    final effectiveStorePassword = storePassword.isEmpty
+        ? keyPassword
+        : storePassword;
+    final effectiveKeyPassword = keyPassword.isEmpty
+        ? effectiveStorePassword
+        : keyPassword;
+
+    if (normalizedKeystorePath.isEmpty) {
+      return const _SigningConfigValidationResult.error('请选择签名文件');
+    }
+    if (!_fileExistsSafely(normalizedKeystorePath)) {
+      return _SigningConfigValidationResult.error(
+        '签名文件不存在：$normalizedKeystorePath',
+      );
+    }
+    if (normalizedAlias.isEmpty) {
+      return const _SigningConfigValidationResult.error('请输入 alias');
+    }
+    if (effectiveStorePassword.isEmpty || effectiveKeyPassword.isEmpty) {
+      return const _SigningConfigValidationResult.error(
+        '请输入密钥密码；密钥库密码为空时会自动尝试使用密钥密码',
+      );
+    }
+
+    Directory? tempDirectory;
+    try {
+      final apksignerExecutable = await _resolveBuildToolExecutable(
+        configuredExecutable: '',
+        executableName: 'apksigner',
+      );
+      tempDirectory = await Directory.systemTemp.createTemp(
+        'z1_engine_signing_validate_',
+      );
+      final unsignedApkPath = _joinPath(tempDirectory.path, 'probe.apk');
+      final signedApkPath = _joinPath(tempDirectory.path, 'probe_signed.apk');
+      await _writeSigningProbeApk(unsignedApkPath);
+
+      final config = AndroidSigningConfig(
+        id: 'validation',
+        name: normalizedAlias,
+        keystorePath: normalizedKeystorePath,
+        keyAlias: normalizedAlias,
+        storePassword: effectiveStorePassword,
+        keyPassword: effectiveKeyPassword,
+        signingScheme: signingScheme,
+      );
+      final args = _buildSigningArgs(
+        config,
+        unsignedApkPath,
+        signedApkPath,
+        false,
+      )..insertAll(1, ['--min-sdk-version', '23']);
+      final result = await Process.run(
+        apksignerExecutable,
+        args,
+        runInShell: Platform.isWindows,
+      );
+
+      if (result.exitCode != 0) {
+        return _SigningConfigValidationResult.error(
+          _signingValidationFailureMessage(result),
+        );
+      }
+
+      return _SigningConfigValidationResult.success(
+        storePassword: effectiveStorePassword,
+        keyPassword: effectiveKeyPassword,
+      );
+    } on ProcessException catch (error) {
+      return _SigningConfigValidationResult.error(
+        '签名配置校验失败，apksigner 启动失败：${error.message}',
+      );
+    } on FileSystemException catch (error) {
+      return _SigningConfigValidationResult.error(
+        '签名配置校验失败，文件处理失败：${error.message}',
+      );
+    } finally {
+      if (tempDirectory != null && await tempDirectory.exists()) {
+        await tempDirectory.delete(recursive: true);
+      }
+    }
+  }
+
+  Future<void> _writeSigningProbeApk(String path) async {
+    final archive = Archive()
+      ..addFile(
+        ArchiveFile.string(
+          'AndroidManifest.xml',
+          '<manifest package="z1.engine.validation" />',
+        ),
+      );
+    final bytes = ZipEncoder().encode(archive);
+    await File(path).writeAsBytes(bytes);
+  }
+
+  String _signingValidationFailureMessage(ProcessResult result) {
+    final output = [
+      result.stdout.toString().trim(),
+      result.stderr.toString().trim(),
+    ].where((text) => text.isNotEmpty).join('\n');
+    if (output.contains('Wrong password') ||
+        output.contains('Cannot recover key') ||
+        output.contains('Failed to obtain key') ||
+        output.contains('Failed to load signer')) {
+      return '签名配置校验失败：alias 或密码不正确，请检查签名文件、alias、密钥库密码和密钥密码';
+    }
+
+    final summary = output
+        .split(RegExp(r'\r?\n'))
+        .where((line) => line.trim().isNotEmpty)
+        .take(4)
+        .join(' ');
+    return summary.isEmpty ? '签名配置校验失败' : '签名配置校验失败：$summary';
+  }
+
   Set<String> get _activeObfuscationConfig {
     return _selectedObfuscationTarget == PackageTarget.android
         ? _androidObfuscationConfig
@@ -1588,4 +1901,19 @@ class EngineMenuController extends ChangeNotifier {
       twoDigits(now.second),
     ].join(':');
   }
+}
+
+class _SigningConfigValidationResult {
+  const _SigningConfigValidationResult.success({
+    required this.storePassword,
+    required this.keyPassword,
+  }) : errorMessage = null;
+
+  const _SigningConfigValidationResult.error(this.errorMessage)
+    : storePassword = '',
+      keyPassword = '';
+
+  final String? errorMessage;
+  final String storePassword;
+  final String keyPassword;
 }

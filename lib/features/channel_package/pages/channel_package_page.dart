@@ -381,6 +381,215 @@ class ChannelReaderGuidePage extends StatelessWidget {
 val channel = WalleChannelReader.getChannel(this) ?: "official"
 ''';
 
+  static const String _flutterBridgeSnippet = '''
+// android/app/src/main/kotlin/.../MainActivity.kt
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+
+class MainActivity : FlutterActivity() {
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "app.channel/apk"
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "sourceDir" -> result.success(applicationInfo.sourceDir)
+                else -> result.notImplemented()
+            }
+        }
+    }
+}
+''';
+
+  static const String _flutterDartSnippet = '''
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/services.dart';
+
+const _apkChannel = MethodChannel('app.channel/apk');
+const _channelBlockId = 0x71777777;
+const _apkSigningBlockMagic = [
+  0x41, 0x50, 0x4B, 0x20, 0x53, 0x69, 0x67, 0x20,
+  0x42, 0x6C, 0x6F, 0x63, 0x6B, 0x20, 0x34, 0x32,
+];
+
+Future<String> currentChannel() async {
+  final sourceDir = await _apkChannel.invokeMethod<String>('sourceDir');
+  if (sourceDir == null || sourceDir.isEmpty) {
+    return 'official';
+  }
+
+  return await readApkChannel(sourceDir) ?? 'official';
+}
+
+Future<String?> readApkChannel(String apkPath) async {
+  final bytes = await File(apkPath).readAsBytes();
+  final eocdOffset = _findEocd(bytes);
+  final centralDirOffset = _u32(bytes, eocdOffset + 16);
+
+  final magicOffset = centralDirOffset - _apkSigningBlockMagic.length;
+  for (var i = 0; i < _apkSigningBlockMagic.length; i += 1) {
+    if (bytes[magicOffset + i] != _apkSigningBlockMagic[i]) return null;
+  }
+
+  final blockSize = _u64(bytes, centralDirOffset - 24);
+  final blockStart = centralDirOffset - blockSize - 8;
+  var cursor = blockStart + 8;
+  final pairsEnd = centralDirOffset - 24;
+
+  while (cursor < pairsEnd) {
+    final pairLength = _u64(bytes, cursor);
+    final pairStart = cursor + 8;
+    final pairEnd = pairStart + pairLength;
+    final id = _u32(bytes, pairStart);
+
+    if (id == _channelBlockId) {
+      return utf8.decode(bytes.sublist(pairStart + 4, pairEnd));
+    }
+
+    cursor = pairEnd;
+  }
+
+  return null;
+}
+
+int _findEocd(Uint8List bytes) {
+  const eocdMinLength = 22;
+  const maxCommentLength = 0xFFFF;
+  const eocdSignature = 0x06054B50;
+  final stopOffset = (bytes.length - eocdMinLength - maxCommentLength)
+      .clamp(0, bytes.length);
+
+  for (var offset = bytes.length - eocdMinLength;
+      offset >= stopOffset;
+      offset -= 1) {
+    if (_u32(bytes, offset) != eocdSignature) continue;
+
+    final commentLength = _u16(bytes, offset + 20);
+    if (offset + eocdMinLength + commentLength == bytes.length) {
+      return offset;
+    }
+  }
+
+  throw StateError('APK EOCD not found');
+}
+
+int _u16(Uint8List bytes, int offset) {
+  return ByteData.sublistView(bytes, offset, offset + 2)
+      .getUint16(0, Endian.little);
+}
+
+int _u32(Uint8List bytes, int offset) {
+  return ByteData.sublistView(bytes, offset, offset + 4)
+      .getUint32(0, Endian.little);
+}
+
+int _u64(Uint8List bytes, int offset) {
+  return ByteData.sublistView(bytes, offset, offset + 8)
+      .getUint64(0, Endian.little);
+}
+''';
+
+  static const String _androidNativeSnippet = '''
+import android.content.Context
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
+
+object ApkChannelReader {
+    private const val CHANNEL_BLOCK_ID = 0x71777777
+    private const val EOCD_SIGNATURE = 0x06054B50
+    private val APK_SIG_BLOCK_MAGIC = byteArrayOf(
+        0x41, 0x50, 0x4B, 0x20, 0x53, 0x69, 0x67, 0x20,
+        0x42, 0x6C, 0x6F, 0x63, 0x6B, 0x20, 0x34, 0x32
+    )
+
+    fun getChannel(context: Context): String {
+        return readChannel(context.applicationInfo.sourceDir) ?: "official"
+    }
+
+    fun readChannel(apkPath: String): String? {
+        RandomAccessFile(apkPath, "r").use { file ->
+            val bytes = ByteArray(file.length().toInt())
+            file.readFully(bytes)
+            val eocdOffset = findEocd(bytes)
+            val centralDirOffset = u32(bytes, eocdOffset + 16)
+
+            val magicOffset = centralDirOffset - APK_SIG_BLOCK_MAGIC.size
+            if (!APK_SIG_BLOCK_MAGIC.indices.all {
+                    bytes[magicOffset + it] == APK_SIG_BLOCK_MAGIC[it]
+                }) {
+                return null
+            }
+
+            val blockSize = u64(bytes, centralDirOffset - 24)
+            val blockStart = centralDirOffset - blockSize - 8
+            var cursor = blockStart + 8
+            val pairsEnd = centralDirOffset - 24
+
+            while (cursor < pairsEnd) {
+                val pairLength = u64(bytes, cursor)
+                val pairStart = cursor + 8
+                val pairEnd = pairStart + pairLength
+                val id = u32(bytes, pairStart)
+
+                if (id == CHANNEL_BLOCK_ID) {
+                    return String(
+                        bytes.copyOfRange(pairStart + 4, pairEnd),
+                        StandardCharsets.UTF_8
+                    )
+                }
+
+                cursor = pairEnd
+            }
+        }
+
+        return null
+    }
+
+    private fun findEocd(bytes: ByteArray): Int {
+        val minLength = 22
+        val maxCommentLength = 0xFFFF
+        val stopOffset = maxOf(0, bytes.size - minLength - maxCommentLength)
+
+        for (offset in bytes.size - minLength downTo stopOffset) {
+            if (u32(bytes, offset) != EOCD_SIGNATURE) continue
+            val commentLength = u16(bytes, offset + 20)
+            if (offset + minLength + commentLength == bytes.size) {
+                return offset
+            }
+        }
+
+        error("APK EOCD not found")
+    }
+
+    private fun u16(bytes: ByteArray, offset: Int): Int {
+        return ByteBuffer.wrap(bytes, offset, 2)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .short.toInt() and 0xFFFF
+    }
+
+    private fun u32(bytes: ByteArray, offset: Int): Int {
+        return ByteBuffer.wrap(bytes, offset, 4)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .int
+    }
+
+    private fun u64(bytes: ByteArray, offset: Int): Int {
+        return ByteBuffer.wrap(bytes, offset, 8)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .long
+            .toInt()
+    }
+}
+''';
+
   static const String _formatSnippet = '''
 Block ID: 0x71777777
 Value: UTF-8 channel code, such as ch001, ch002, google_play
@@ -426,6 +635,24 @@ Value: UTF-8 channel code, such as ch001, ch002, google_play
                   ),
                   const SizedBox(height: 10),
                   const _CodeBlock(text: _kotlinSnippet),
+                  const SizedBox(height: 24),
+                  const _GuideSectionTitle('Flutter / Dart 直接读取'),
+                  const SizedBox(height: 10),
+                  const _GuideParagraph(
+                    'Flutter 侧需要先通过 Android 原生桥接拿到当前已安装 APK 的 sourceDir，然后 Dart 直接解析 APK Signing Block。',
+                  ),
+                  const SizedBox(height: 10),
+                  const _CodeBlock(text: _flutterBridgeSnippet),
+                  const SizedBox(height: 12),
+                  const _CodeBlock(text: _flutterDartSnippet),
+                  const SizedBox(height: 24),
+                  const _GuideSectionTitle('Android 原生 Kotlin 直接读取'),
+                  const SizedBox(height: 10),
+                  const _GuideParagraph(
+                    '原生 Android 可以直接使用 applicationInfo.sourceDir 读取当前 APK，并从 Block ID 0x71777777 中取出 UTF-8 渠道码。',
+                  ),
+                  const SizedBox(height: 10),
+                  const _CodeBlock(text: _androidNativeSnippet),
                   const SizedBox(height: 24),
                   const _GuideSectionTitle('覆盖安装关系'),
                   const SizedBox(height: 10),
@@ -490,13 +717,16 @@ class _CodeBlock extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: const Color(0xFF293244)),
       ),
-      child: SelectableText(
-        text.trim(),
-        style: const TextStyle(
-          color: Color(0xFFE5E7EB),
-          fontFamily: 'monospace',
-          fontSize: 13,
-          height: 1.5,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: SelectableText(
+          text.trim(),
+          style: const TextStyle(
+            color: Color(0xFFE5E7EB),
+            fontFamily: 'monospace',
+            fontSize: 13,
+            height: 1.5,
+          ),
         ),
       ),
     );
