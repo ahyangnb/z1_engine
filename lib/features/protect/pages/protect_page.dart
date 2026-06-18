@@ -14,7 +14,7 @@ class ProtectPage extends StatelessWidget {
 
     return SectionPanel(
       title: '加固',
-      subtitle: '上传 APK 后注入早启动防护，检测算法注入、Frida/Gadget、异常二进制和 VPN 风险。',
+      subtitle: '上传 APK 后注入早启动防护，校验包名、签名证书、包体摘要并检测运行时风险。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

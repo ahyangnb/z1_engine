@@ -1,5 +1,10 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
 import 'package:z1_engine/core/models/android_signing_config.dart';
 
 class ApkHardeningService {
@@ -16,6 +21,7 @@ class ApkHardeningService {
 
     final apktool = await _resolvePathExecutable('apktool');
     final javac = await _resolveJavac();
+    final keytool = await _resolveJavaTool('keytool');
     final d8 = await _resolveBuildToolExecutable(
       configuredExecutable: '',
       executableName: 'd8',
@@ -48,6 +54,10 @@ class ApkHardeningService {
     final guardDexDirectory = Directory(
       _joinPath(workDirectory.path, 'guard_dex'),
     );
+    final profileUnsignedApkPath = _joinPath(
+      workDirectory.path,
+      'profile_unsigned.apk',
+    );
     final unsignedApkPath = _joinPath(workDirectory.path, 'unsigned.apk');
     final alignedApkPath = _joinPath(workDirectory.path, 'aligned.apk');
 
@@ -55,6 +65,7 @@ class ApkHardeningService {
       logs.add('工作目录：${workDirectory.path}');
       logs.add('apktool：$apktool');
       logs.add('javac：$javac');
+      logs.add('keytool：$keytool');
       logs.add('d8：$d8');
       logs.add('android.jar：$androidJar');
 
@@ -86,73 +97,105 @@ class ApkHardeningService {
       }
 
       final nextDexIndex = _nextDexIndex(decodedDirectory);
+      final guardDexName = _dexFileName(nextDexIndex);
       logs.add('目标包名：$packageName');
-      logs.add('注入 dex：classes$nextDexIndex.dex');
+      logs.add('注入 dex：$guardDexName');
 
       await manifestFile.writeAsString(
         _injectGuardProvider(manifestContent, packageName),
       );
 
-      await _writeGuardJavaSources(guardSourceDirectory);
-      await guardClassesDirectory.create(recursive: true);
-      await guardDexDirectory.create(recursive: true);
+      final expectedCertificateSha256 = await _readSigningCertificateSha256(
+        keytoolExecutable: keytool,
+        signingConfig: signingConfig,
+      );
+      logs.add('签名证书 SHA-256：${_shortDigest(expectedCertificateSha256)}');
 
-      await _runChecked(
-        javac,
-        [
-          '-source',
-          '8',
-          '-target',
-          '8',
-          '-encoding',
-          'UTF-8',
-          '-cp',
-          androidJar,
-          '-d',
-          guardClassesDirectory.path,
-          _joinPath(
-            _joinPath(_joinPath(guardSourceDirectory.path, 'com'), 'z1'),
-            'guard/Z1Guard.java',
-          ),
-          _joinPath(
-            _joinPath(_joinPath(guardSourceDirectory.path, 'com'), 'z1'),
-            'guard/Z1GuardProvider.java',
-          ),
-        ],
-        logs,
-        label: 'javac guard',
+      final profileAssetName = 'z1_guard/profile.dat';
+      final profileApkEntryName = 'assets/$profileAssetName';
+      final ignoredProfileEntries = {guardDexName, profileApkEntryName};
+      final placeholderConfig = _GuardBuildConfig(
+        expectedPackageName: packageName,
+        expectedCertificateSha256: expectedCertificateSha256,
+        guardDexName: guardDexName,
+        profileAssetName: profileAssetName,
+        profileApkEntryName: profileApkEntryName,
+        expectedProfileSha256: '',
+        profileXorKeyHex: '',
+      );
+      await _compileGuardDex(
+        javac: javac,
+        d8: d8,
+        androidJar: androidJar,
+        minSdk: minSdk,
+        sourceDirectory: guardSourceDirectory,
+        classesDirectory: guardClassesDirectory,
+        dexDirectory: guardDexDirectory,
+        config: placeholderConfig,
+        logs: logs,
+        labelSuffix: 'profile',
+      );
+
+      await _copyGuardDex(
+        guardDexDirectory: guardDexDirectory,
+        decodedDirectory: decodedDirectory,
+        guardDexName: guardDexName,
       );
 
       await _runChecked(
-        d8,
-        [
-          '--min-api',
-          minSdk.toString(),
-          '--lib',
-          androidJar,
-          '--output',
-          guardDexDirectory.path,
-          _joinPath(
-            _joinPath(_joinPath(guardClassesDirectory.path, 'com'), 'z1'),
-            'guard/Z1Guard.class',
-          ),
-          _joinPath(
-            _joinPath(_joinPath(guardClassesDirectory.path, 'com'), 'z1'),
-            'guard/Z1GuardProvider.class',
-          ),
-        ],
+        apktool,
+        ['b', '-f', '-o', profileUnsignedApkPath, decodedDirectory.path],
         logs,
-        label: 'd8 guard',
+        label: 'apktool build profile',
       );
 
-      final guardDexFile = File(
-        _joinPath(guardDexDirectory.path, 'classes.dex'),
+      final integrityProfile = await _buildIntegrityProfile(
+        apkPath: profileUnsignedApkPath,
+        ignoredEntries: ignoredProfileEntries,
       );
-      if (!guardDexFile.existsSync()) {
-        throw const ApkHardeningException('Guard dex 生成失败');
-      }
-      await guardDexFile.copy(
-        _joinPath(decodedDirectory.path, 'classes$nextDexIndex.dex'),
+      final plainProfileBytes = _encodeIntegrityProfile(
+        packageName: packageName,
+        guardDexName: guardDexName,
+        entries: integrityProfile.entries,
+      );
+      final profileXorKey = _secureRandomBytes(16);
+      final protectedProfileBytes = _xorBytes(plainProfileBytes, profileXorKey);
+      final expectedProfileSha256 = sha256
+          .convert(protectedProfileBytes)
+          .toString();
+      await _writeProfileAsset(
+        decodedDirectory: decodedDirectory,
+        profileAssetName: profileAssetName,
+        protectedProfileBytes: protectedProfileBytes,
+      );
+      logs.add('包体摘要基线：${integrityProfile.entries.length} 个条目');
+      logs.add('基线资产 SHA-256：${_shortDigest(expectedProfileSha256)}');
+
+      final finalConfig = _GuardBuildConfig(
+        expectedPackageName: packageName,
+        expectedCertificateSha256: expectedCertificateSha256,
+        guardDexName: guardDexName,
+        profileAssetName: profileAssetName,
+        profileApkEntryName: profileApkEntryName,
+        expectedProfileSha256: expectedProfileSha256,
+        profileXorKeyHex: _bytesToHex(profileXorKey),
+      );
+      await _compileGuardDex(
+        javac: javac,
+        d8: d8,
+        androidJar: androidJar,
+        minSdk: minSdk,
+        sourceDirectory: guardSourceDirectory,
+        classesDirectory: guardClassesDirectory,
+        dexDirectory: guardDexDirectory,
+        config: finalConfig,
+        logs: logs,
+        labelSuffix: 'final',
+      );
+      await _copyGuardDex(
+        guardDexDirectory: guardDexDirectory,
+        decodedDirectory: decodedDirectory,
+        guardDexName: guardDexName,
       );
 
       await _runChecked(
@@ -190,6 +233,20 @@ class ApkHardeningService {
         label: 'apksigner verify',
       );
 
+      final finalProfile = await _buildIntegrityProfile(
+        apkPath: outputApkPath,
+        ignoredEntries: ignoredProfileEntries,
+      );
+      final finalProfileBytes = _encodeIntegrityProfile(
+        packageName: packageName,
+        guardDexName: guardDexName,
+        entries: finalProfile.entries,
+      );
+      if (!_bytesEqual(finalProfileBytes, plainProfileBytes)) {
+        throw const ApkHardeningException('输出 APK 包体摘要基线复核失败');
+      }
+      logs.add('输出 APK 包体摘要基线复核通过');
+
       return ApkHardeningResult(
         outputApkPath: outputApkPath,
         packageName: packageName,
@@ -200,6 +257,108 @@ class ApkHardeningService {
         await workDirectory.delete(recursive: true);
       }
     }
+  }
+
+  Future<void> _compileGuardDex({
+    required String javac,
+    required String d8,
+    required String androidJar,
+    required int minSdk,
+    required Directory sourceDirectory,
+    required Directory classesDirectory,
+    required Directory dexDirectory,
+    required _GuardBuildConfig config,
+    required List<String> logs,
+    required String labelSuffix,
+  }) async {
+    if (sourceDirectory.existsSync()) {
+      await sourceDirectory.delete(recursive: true);
+    }
+    if (classesDirectory.existsSync()) {
+      await classesDirectory.delete(recursive: true);
+    }
+    if (dexDirectory.existsSync()) {
+      await dexDirectory.delete(recursive: true);
+    }
+
+    await _writeGuardJavaSources(sourceDirectory, config);
+    await classesDirectory.create(recursive: true);
+    await dexDirectory.create(recursive: true);
+
+    await _runChecked(
+      javac,
+      [
+        '-source',
+        '8',
+        '-target',
+        '8',
+        '-encoding',
+        'UTF-8',
+        '-cp',
+        androidJar,
+        '-d',
+        classesDirectory.path,
+        _joinPath(
+          _joinPath(_joinPath(sourceDirectory.path, 'com'), 'z1'),
+          'guard/Z1Guard.java',
+        ),
+        _joinPath(
+          _joinPath(_joinPath(sourceDirectory.path, 'com'), 'z1'),
+          'guard/Z1GuardProvider.java',
+        ),
+      ],
+      logs,
+      label: 'javac guard $labelSuffix',
+    );
+
+    final classFiles = _listClassFiles(classesDirectory);
+    if (classFiles.isEmpty) {
+      throw const ApkHardeningException('Guard class 生成失败');
+    }
+
+    await _runChecked(
+      d8,
+      [
+        '--min-api',
+        minSdk.toString(),
+        '--lib',
+        androidJar,
+        '--output',
+        dexDirectory.path,
+        ...classFiles,
+      ],
+      logs,
+      label: 'd8 guard $labelSuffix',
+    );
+  }
+
+  Future<void> _copyGuardDex({
+    required Directory guardDexDirectory,
+    required Directory decodedDirectory,
+    required String guardDexName,
+  }) async {
+    final guardDexFile = File(_joinPath(guardDexDirectory.path, 'classes.dex'));
+    if (!guardDexFile.existsSync()) {
+      throw const ApkHardeningException('Guard dex 生成失败');
+    }
+
+    await guardDexFile.copy(_joinPath(decodedDirectory.path, guardDexName));
+  }
+
+  List<String> _listClassFiles(Directory classesDirectory) {
+    if (!classesDirectory.existsSync()) {
+      return [];
+    }
+
+    final classFiles =
+        classesDirectory
+            .listSync(recursive: true)
+            .whereType<File>()
+            .where((file) => file.path.endsWith('.class'))
+            .map((file) => file.path)
+            .toList()
+          ..sort();
+    return classFiles;
   }
 
   Future<void> _runChecked(
@@ -228,7 +387,10 @@ class ApkHardeningService {
     }
   }
 
-  Future<void> _writeGuardJavaSources(Directory sourceDirectory) async {
+  Future<void> _writeGuardJavaSources(
+    Directory sourceDirectory,
+    _GuardBuildConfig config,
+  ) async {
     final packageDirectory = Directory(
       _joinPath(
         _joinPath(_joinPath(sourceDirectory.path, 'com'), 'z1'),
@@ -241,7 +403,7 @@ class ApkHardeningService {
     ).writeAsString(_guardProviderJava);
     await File(
       _joinPath(packageDirectory.path, 'Z1Guard.java'),
-    ).writeAsString(_guardJava);
+    ).writeAsString(_buildGuardJava(config));
   }
 
   String _injectGuardProvider(String manifestContent, String packageName) {
@@ -266,6 +428,220 @@ class ApkHardeningService {
       closeApplicationIndex,
       provider,
     );
+  }
+
+  Future<String> _readSigningCertificateSha256({
+    required String keytoolExecutable,
+    required AndroidSigningConfig signingConfig,
+  }) async {
+    final keystoreFile = File(signingConfig.keystorePath);
+    if (!keystoreFile.existsSync()) {
+      throw ApkHardeningException(
+        '签名 keystore 不存在：${signingConfig.keystorePath}',
+      );
+    }
+
+    final result = await Process.run(keytoolExecutable, [
+      '-exportcert',
+      '-rfc',
+      '-keystore',
+      signingConfig.keystorePath,
+      '-alias',
+      signingConfig.keyAlias,
+      '-storepass',
+      signingConfig.storePassword,
+    ], runInShell: Platform.isWindows);
+    if (result.exitCode != 0) {
+      final error = result.stderr.toString().trim();
+      throw ApkHardeningException('读取签名证书失败${error.isEmpty ? '' : '：$error'}');
+    }
+
+    final pem = result.stdout.toString();
+    final match = RegExp(
+      r'-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----',
+    ).firstMatch(pem);
+    if (match == null) {
+      throw const ApkHardeningException('读取签名证书失败：keytool 未输出证书内容');
+    }
+
+    final certificateBase64 = match.group(1)!.replaceAll(RegExp(r'\s+'), '');
+    final certificateBytes = base64Decode(certificateBase64);
+    return sha256.convert(certificateBytes).toString();
+  }
+
+  Future<_ApkIntegrityProfile> _buildIntegrityProfile({
+    required String apkPath,
+    required Set<String> ignoredEntries,
+  }) async {
+    final apkFile = File(apkPath);
+    if (!apkFile.existsSync()) {
+      throw ApkHardeningException('APK 文件不存在：$apkPath');
+    }
+
+    final input = InputFileStream(apkPath);
+    Archive? archive;
+    try {
+      archive = ZipDecoder().decodeStream(input);
+      final entries = <_ApkIntegrityProfileEntry>[];
+      for (final entry in archive.files) {
+        if (!entry.isFile) {
+          continue;
+        }
+
+        final normalizedPath = _normalizeArchivePath(entry.name);
+        if (normalizedPath.isEmpty ||
+            _shouldIgnoreIntegrityEntry(normalizedPath, ignoredEntries)) {
+          continue;
+        }
+
+        final bytes = entry.readBytes();
+        if (bytes == null) {
+          continue;
+        }
+
+        entries.add(
+          _ApkIntegrityProfileEntry(
+            path: normalizedPath,
+            sizeBytes: bytes.length,
+            sha256Hex: sha256.convert(bytes).toString(),
+          ),
+        );
+      }
+
+      entries.sort((left, right) => left.path.compareTo(right.path));
+      if (entries.isEmpty) {
+        throw const ApkHardeningException('无法生成包体摘要基线：APK 中未发现可校验文件');
+      }
+
+      return _ApkIntegrityProfile(entries);
+    } on ApkHardeningException {
+      rethrow;
+    } on ArchiveException catch (error) {
+      throw ApkHardeningException('APK 解包失败：${error.message}');
+    } finally {
+      archive?.clearSync();
+      input.closeSync();
+    }
+  }
+
+  Uint8List _encodeIntegrityProfile({
+    required String packageName,
+    required String guardDexName,
+    required List<_ApkIntegrityProfileEntry> entries,
+  }) {
+    final buffer = StringBuffer()
+      ..writeln(
+        [
+          'Z1APKPROFILE',
+          '1',
+          base64Url.encode(utf8.encode(packageName)),
+          base64Url.encode(utf8.encode(guardDexName)),
+        ].join('|'),
+      );
+
+    for (final entry in entries) {
+      buffer.writeln(
+        [
+          base64Url.encode(utf8.encode(entry.path)),
+          entry.sizeBytes.toString(),
+          entry.sha256Hex,
+        ].join('|'),
+      );
+    }
+
+    return Uint8List.fromList(utf8.encode(buffer.toString()));
+  }
+
+  Future<void> _writeProfileAsset({
+    required Directory decodedDirectory,
+    required String profileAssetName,
+    required Uint8List protectedProfileBytes,
+  }) async {
+    final profileAssetFile = File(
+      _joinPath(_joinPath(decodedDirectory.path, 'assets'), profileAssetName),
+    );
+    await profileAssetFile.parent.create(recursive: true);
+    await profileAssetFile.writeAsBytes(protectedProfileBytes, flush: true);
+  }
+
+  bool _shouldIgnoreIntegrityEntry(
+    String normalizedPath,
+    Set<String> ignoredEntries,
+  ) {
+    if (ignoredEntries.contains(normalizedPath)) {
+      return true;
+    }
+
+    final upperPath = normalizedPath.toUpperCase();
+    return upperPath.startsWith('META-INF/') ||
+        normalizedPath == 'stamp-cert-sha256';
+  }
+
+  String _normalizeArchivePath(String path) {
+    var normalized = path.replaceAll(r'\', '/').trim();
+    while (normalized.startsWith('/')) {
+      normalized = normalized.substring(1);
+    }
+    while (normalized.startsWith('./')) {
+      normalized = normalized.substring(2);
+    }
+
+    return normalized;
+  }
+
+  Uint8List _secureRandomBytes(int length) {
+    final random = Random.secure();
+    return Uint8List.fromList(
+      List<int>.generate(length, (_) => random.nextInt(256)),
+    );
+  }
+
+  Uint8List _xorBytes(Uint8List bytes, Uint8List key) {
+    if (key.isEmpty) {
+      return Uint8List.fromList(bytes);
+    }
+
+    final output = Uint8List(bytes.length);
+    for (var index = 0; index < bytes.length; index += 1) {
+      output[index] = bytes[index] ^ key[index % key.length];
+    }
+
+    return output;
+  }
+
+  bool _bytesEqual(Uint8List left, Uint8List right) {
+    if (left.length != right.length) {
+      return false;
+    }
+
+    var diff = 0;
+    for (var index = 0; index < left.length; index += 1) {
+      diff |= left[index] ^ right[index];
+    }
+
+    return diff == 0;
+  }
+
+  String _bytesToHex(List<int> bytes) {
+    final buffer = StringBuffer();
+    for (final byte in bytes) {
+      buffer.write(byte.toRadixString(16).padLeft(2, '0'));
+    }
+
+    return buffer.toString();
+  }
+
+  String _shortDigest(String digest) {
+    final normalized = digest.trim();
+    if (normalized.length <= 16) {
+      return normalized;
+    }
+
+    return '${normalized.substring(0, 16)}...';
+  }
+
+  String _dexFileName(int dexIndex) {
+    return dexIndex <= 1 ? 'classes.dex' : 'classes$dexIndex.dex';
   }
 
   String? _readPackageName(String manifestContent) {
@@ -302,7 +678,7 @@ class ApkHardeningService {
   }
 
   int _nextDexIndex(Directory decodedDirectory) {
-    var maxIndex = 1;
+    var maxIndex = 0;
     final dexPattern = RegExp(r'^classes([0-9]*)\.dex$');
     final smaliPattern = RegExp(r'^smali(?:_classes([0-9]+))?$');
     for (final entity in decodedDirectory.listSync()) {
@@ -369,18 +745,22 @@ class ApkHardeningService {
   }
 
   Future<String> _resolveJavac() async {
+    return _resolveJavaTool('javac');
+  }
+
+  Future<String> _resolveJavaTool(String executableName) async {
     final javaHome = Platform.environment['JAVA_HOME'];
     if (javaHome != null && javaHome.trim().isNotEmpty) {
       final candidate = _joinPath(
         _joinPath(javaHome.trim(), 'bin'),
-        _javacName,
+        _javaToolName(executableName),
       );
       if (_fileExistsSafely(candidate)) {
         return candidate;
       }
     }
 
-    final pathExecutable = await _findExecutableOnPath('javac');
+    final pathExecutable = await _findExecutableOnPath(executableName);
     if (pathExecutable != null) {
       return pathExecutable;
     }
@@ -389,7 +769,10 @@ class ApkHardeningService {
       try {
         final result = await Process.run('/usr/libexec/java_home', []);
         final home = result.stdout.toString().trim();
-        final candidate = _joinPath(_joinPath(home, 'bin'), _javacName);
+        final candidate = _joinPath(
+          _joinPath(home, 'bin'),
+          _javaToolName(executableName),
+        );
         if (result.exitCode == 0 && _fileExistsSafely(candidate)) {
           return candidate;
         }
@@ -398,11 +781,17 @@ class ApkHardeningService {
       }
     }
 
-    throw const ApkHardeningException('未找到 javac，请安装 JDK 或配置 JAVA_HOME');
+    throw ApkHardeningException('未找到 $executableName，请安装 JDK 或配置 JAVA_HOME');
   }
 
-  String get _javacName {
-    return Platform.isWindows ? 'javac.exe' : 'javac';
+  String _javaToolName(String executableName) {
+    if (!Platform.isWindows) {
+      return executableName;
+    }
+
+    return executableName.endsWith('.exe')
+        ? executableName
+        : '$executableName.exe';
   }
 
   Future<String> _resolvePathExecutable(String executableName) async {
@@ -654,6 +1043,77 @@ class ApkHardeningException implements Exception {
   String toString() => message;
 }
 
+class _GuardBuildConfig {
+  const _GuardBuildConfig({
+    required this.expectedPackageName,
+    required this.expectedCertificateSha256,
+    required this.guardDexName,
+    required this.profileAssetName,
+    required this.profileApkEntryName,
+    required this.expectedProfileSha256,
+    required this.profileXorKeyHex,
+  });
+
+  final String expectedPackageName;
+  final String expectedCertificateSha256;
+  final String guardDexName;
+  final String profileAssetName;
+  final String profileApkEntryName;
+  final String expectedProfileSha256;
+  final String profileXorKeyHex;
+}
+
+class _ApkIntegrityProfile {
+  const _ApkIntegrityProfile(this.entries);
+
+  final List<_ApkIntegrityProfileEntry> entries;
+}
+
+class _ApkIntegrityProfileEntry {
+  const _ApkIntegrityProfileEntry({
+    required this.path,
+    required this.sizeBytes,
+    required this.sha256Hex,
+  });
+
+  final String path;
+  final int sizeBytes;
+  final String sha256Hex;
+}
+
+String _buildGuardJava(_GuardBuildConfig config) {
+  return _guardJavaTemplate
+      .replaceAll(
+        '__EXPECTED_PACKAGE_NAME__',
+        _javaString(config.expectedPackageName),
+      )
+      .replaceAll(
+        '__EXPECTED_CERTIFICATE_SHA256__',
+        _javaString(config.expectedCertificateSha256),
+      )
+      .replaceAll('__GUARD_DEX_NAME__', _javaString(config.guardDexName))
+      .replaceAll(
+        '__PROFILE_ASSET_NAME__',
+        _javaString(config.profileAssetName),
+      )
+      .replaceAll(
+        '__PROFILE_APK_ENTRY_NAME__',
+        _javaString(config.profileApkEntryName),
+      )
+      .replaceAll(
+        '__EXPECTED_PROFILE_SHA256__',
+        _javaString(config.expectedProfileSha256),
+      )
+      .replaceAll(
+        '__PROFILE_XOR_KEY_HEX__',
+        _javaString(config.profileXorKeyHex),
+      );
+}
+
+String _javaString(String value) {
+  return jsonEncode(value);
+}
+
 const _guardProviderJava = r'''
 package com.z1.guard;
 
@@ -696,27 +1156,48 @@ public final class Z1GuardProvider extends ContentProvider {
 }
 ''';
 
-const _guardJava = r'''
+const _guardJavaTemplate = r'''
 package com.z1.guard;
 
 import android.app.Application;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.os.Process;
+import android.util.Base64;
 import android.util.Log;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
+import java.io.InputStream;
+import java.security.MessageDigest;
+import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 public final class Z1Guard {
     private static final String TAG = "Z1Guard";
+    private static final String EXPECTED_PACKAGE_NAME = __EXPECTED_PACKAGE_NAME__;
+    private static final String EXPECTED_CERTIFICATE_SHA256 = __EXPECTED_CERTIFICATE_SHA256__;
+    private static final String GUARD_DEX_NAME = __GUARD_DEX_NAME__;
+    private static final String PROFILE_ASSET_NAME = __PROFILE_ASSET_NAME__;
+    private static final String PROFILE_APK_ENTRY_NAME = __PROFILE_APK_ENTRY_NAME__;
+    private static final String EXPECTED_PROFILE_SHA256 = __EXPECTED_PROFILE_SHA256__;
+    private static final String PROFILE_XOR_KEY_HEX = __PROFILE_XOR_KEY_HEX__;
+    private static final int PROFILE_READ_LIMIT_BYTES = 16 * 1024 * 1024;
     private static volatile boolean initialized;
 
     private Z1Guard() {
@@ -735,6 +1216,9 @@ public final class Z1Guard {
 
         StringBuilder reasons = new StringBuilder();
         int score = 0;
+        score += safeCheckPackageName(appContext, reasons);
+        score += safeCheckSigningCertificate(appContext, reasons);
+        score += safeCheckApkIntegrity(appContext, reasons);
         score += safeCheckDebuggable(appContext, reasons);
         score += safeCheckTracerPid(reasons);
         score += safeCheckPrivateFiles(appContext, reasons);
@@ -746,6 +1230,243 @@ public final class Z1Guard {
         if (score >= 6) {
             block(reasons.toString());
         }
+    }
+
+    private static int safeCheckPackageName(Context context, StringBuilder reasons) {
+        try {
+            String packageName = context.getPackageName();
+            if (!EXPECTED_PACKAGE_NAME.equals(packageName)) {
+                appendReason(reasons, "package-name=" + packageName);
+                return 10;
+            }
+        } catch (Throwable error) {
+            appendReason(reasons, "package-name-check-error");
+            return 10;
+        }
+        return 0;
+    }
+
+    private static int safeCheckSigningCertificate(Context context, StringBuilder reasons) {
+        if (EXPECTED_CERTIFICATE_SHA256.length() == 0) {
+            return 0;
+        }
+
+        try {
+            PackageManager packageManager = context.getPackageManager();
+            PackageInfo packageInfo = packageManager.getPackageInfo(
+                    context.getPackageName(),
+                    Build.VERSION.SDK_INT >= 28
+                            ? PackageManager.GET_SIGNING_CERTIFICATES
+                            : PackageManager.GET_SIGNATURES
+            );
+            Signature[] signatures = readCurrentSignatures(packageInfo);
+            if (signatures == null || signatures.length == 0) {
+                appendReason(reasons, "missing-signature");
+                return 10;
+            }
+
+            String firstDigest = "";
+            for (int index = 0; index < signatures.length; index++) {
+                Signature signature = signatures[index];
+                if (signature == null) {
+                    continue;
+                }
+
+                String digest = sha256Hex(signature.toByteArray());
+                if (firstDigest.length() == 0) {
+                    firstDigest = digest;
+                }
+                if (EXPECTED_CERTIFICATE_SHA256.equalsIgnoreCase(digest)) {
+                    return 0;
+                }
+            }
+
+            appendReason(reasons, "signature-sha256=" + trimDigest(firstDigest));
+            return 10;
+        } catch (Throwable error) {
+            appendReason(reasons, "signature-check-error");
+            return 10;
+        }
+    }
+
+    private static Signature[] readCurrentSignatures(PackageInfo packageInfo) {
+        if (packageInfo == null) {
+            return null;
+        }
+
+        if (Build.VERSION.SDK_INT >= 28 && packageInfo.signingInfo != null) {
+            Signature[] signers = packageInfo.signingInfo.getApkContentsSigners();
+            if (signers != null && signers.length > 0) {
+                return signers;
+            }
+            return packageInfo.signingInfo.getSigningCertificateHistory();
+        }
+
+        return packageInfo.signatures;
+    }
+
+    private static int safeCheckApkIntegrity(Context context, StringBuilder reasons) {
+        if (EXPECTED_PROFILE_SHA256.length() == 0 || PROFILE_XOR_KEY_HEX.length() == 0) {
+            return 0;
+        }
+
+        try {
+            byte[] protectedProfile = readAssetBytes(context, PROFILE_ASSET_NAME, PROFILE_READ_LIMIT_BYTES);
+            String profileDigest = sha256Hex(protectedProfile);
+            if (!EXPECTED_PROFILE_SHA256.equalsIgnoreCase(profileDigest)) {
+                appendReason(reasons, "profile-sha256=" + trimDigest(profileDigest));
+                return 10;
+            }
+
+            byte[] profileBytes = xorBytes(protectedProfile, hexToBytes(PROFILE_XOR_KEY_HEX));
+            Map<String, ExpectedEntry> expectedEntries = parseIntegrityProfile(profileBytes);
+            ApplicationInfo info = context.getApplicationInfo();
+            if (info == null || info.sourceDir == null || info.sourceDir.length() == 0) {
+                appendReason(reasons, "missing-source-apk");
+                return 10;
+            }
+
+            return verifyApkEntries(info.sourceDir, expectedEntries, reasons);
+        } catch (Throwable error) {
+            appendReason(reasons, "apk-integrity-check-error");
+            return 10;
+        }
+    }
+
+    private static Map<String, ExpectedEntry> parseIntegrityProfile(byte[] profileBytes) throws Exception {
+        String text = new String(profileBytes, "UTF-8");
+        String[] lines = text.split("\\r?\\n");
+        if (lines.length == 0 || !lines[0].startsWith("Z1APKPROFILE|1|")) {
+            throw new SecurityException("bad profile header");
+        }
+
+        HashMap<String, ExpectedEntry> expectedEntries = new HashMap<String, ExpectedEntry>();
+        for (int index = 1; index < lines.length; index++) {
+            String line = lines[index];
+            if (line == null || line.length() == 0) {
+                continue;
+            }
+
+            String[] parts = line.split("\\|", -1);
+            if (parts.length != 3) {
+                throw new SecurityException("bad profile line");
+            }
+
+            String path = new String(
+                    Base64.decode(parts[0], Base64.URL_SAFE | Base64.NO_WRAP),
+                    "UTF-8"
+            );
+            long size = Long.parseLong(parts[1]);
+            String digest = parts[2].toLowerCase(Locale.US);
+            if (expectedEntries.put(path, new ExpectedEntry(size, digest)) != null) {
+                throw new SecurityException("duplicate profile path");
+            }
+        }
+
+        if (expectedEntries.isEmpty()) {
+            throw new SecurityException("empty profile");
+        }
+        return expectedEntries;
+    }
+
+    private static int verifyApkEntries(
+            String sourceApkPath,
+            Map<String, ExpectedEntry> expectedEntries,
+            StringBuilder reasons
+    ) {
+        ZipFile zipFile = null;
+        try {
+            zipFile = new ZipFile(sourceApkPath);
+            HashMap<String, ExpectedEntry> remaining = new HashMap<String, ExpectedEntry>(expectedEntries);
+            Enumeration<? extends ZipEntry> entries = zipFile.entries();
+            int actualCount = 0;
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (entry == null || entry.isDirectory()) {
+                    continue;
+                }
+
+                String name = normalizeZipEntryName(entry.getName());
+                if (name.length() == 0 || shouldIgnoreApkEntry(name)) {
+                    continue;
+                }
+
+                actualCount++;
+                ExpectedEntry expectedEntry = remaining.remove(name);
+                if (expectedEntry == null) {
+                    appendReason(reasons, "unexpected-entry=" + trimReason(name));
+                    return 10;
+                }
+
+                DigestResult actualDigest = digestZipEntry(zipFile, entry);
+                if (actualDigest.sizeBytes != expectedEntry.sizeBytes) {
+                    appendReason(reasons, "entry-size=" + trimReason(name));
+                    return 10;
+                }
+                if (!expectedEntry.sha256Hex.equalsIgnoreCase(actualDigest.sha256Hex)) {
+                    appendReason(reasons, "entry-sha256=" + trimReason(name));
+                    return 10;
+                }
+            }
+
+            if (!remaining.isEmpty()) {
+                appendReason(reasons, "missing-entry=" + trimReason(remaining.keySet().iterator().next()));
+                return 10;
+            }
+            if (actualCount != expectedEntries.size()) {
+                appendReason(reasons, "entry-count=" + actualCount);
+                return 10;
+            }
+        } catch (Throwable error) {
+            appendReason(reasons, "apk-entry-check-error");
+            return 10;
+        } finally {
+            closeQuietly(zipFile);
+        }
+
+        return 0;
+    }
+
+    private static boolean shouldIgnoreApkEntry(String name) {
+        String upper = name.toUpperCase(Locale.US);
+        return GUARD_DEX_NAME.equals(name)
+                || PROFILE_APK_ENTRY_NAME.equals(name)
+                || upper.startsWith("META-INF/")
+                || "stamp-cert-sha256".equals(name);
+    }
+
+    private static DigestResult digestZipEntry(ZipFile zipFile, ZipEntry entry) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        InputStream input = null;
+        long size = 0;
+        try {
+            input = zipFile.getInputStream(entry);
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
+                size += read;
+            }
+        } finally {
+            closeQuietly(input);
+        }
+
+        return new DigestResult(size, bytesToHex(digest.digest()));
+    }
+
+    private static String normalizeZipEntryName(String name) {
+        if (name == null) {
+            return "";
+        }
+
+        String normalized = name.replace('\\', '/').trim();
+        while (normalized.startsWith("/")) {
+            normalized = normalized.substring(1);
+        }
+        while (normalized.startsWith("./")) {
+            normalized = normalized.substring(2);
+        }
+        return normalized;
     }
 
     private static int safeCheckDebuggable(Context context, StringBuilder reasons) {
@@ -1003,6 +1724,100 @@ public final class Z1Guard {
         }
     }
 
+    private static byte[] readAssetBytes(Context context, String assetName, int maxBytes) throws Exception {
+        InputStream input = null;
+        try {
+            input = context.getAssets().open(assetName);
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int total = 0;
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                total += read;
+                if (total > maxBytes) {
+                    throw new SecurityException("profile too large");
+                }
+                output.write(buffer, 0, read);
+            }
+            return output.toByteArray();
+        } finally {
+            closeQuietly(input);
+        }
+    }
+
+    private static byte[] xorBytes(byte[] bytes, byte[] key) {
+        if (key == null || key.length == 0) {
+            return bytes;
+        }
+
+        byte[] output = new byte[bytes.length];
+        for (int index = 0; index < bytes.length; index++) {
+            output[index] = (byte) (bytes[index] ^ key[index % key.length]);
+        }
+        return output;
+    }
+
+    private static String sha256Hex(byte[] bytes) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        return bytesToHex(digest.digest(bytes));
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        if (hex == null) {
+            return new byte[0];
+        }
+
+        String normalized = hex.trim();
+        int length = normalized.length();
+        if (length == 0 || length % 2 != 0) {
+            return new byte[0];
+        }
+
+        byte[] output = new byte[length / 2];
+        for (int index = 0; index < length; index += 2) {
+            output[index / 2] = (byte) Integer.parseInt(normalized.substring(index, index + 2), 16);
+        }
+        return output;
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        char[] hex = new char[bytes.length * 2];
+        char[] alphabet = "0123456789abcdef".toCharArray();
+        for (int index = 0; index < bytes.length; index++) {
+            int value = bytes[index] & 0xff;
+            hex[index * 2] = alphabet[value >>> 4];
+            hex[index * 2 + 1] = alphabet[value & 0x0f];
+        }
+        return new String(hex);
+    }
+
+    private static String trimDigest(String digest) {
+        if (digest == null || digest.length() <= 16) {
+            return digest == null ? "" : digest;
+        }
+        return digest.substring(0, 16);
+    }
+
+    private static final class ExpectedEntry {
+        private final long sizeBytes;
+        private final String sha256Hex;
+
+        private ExpectedEntry(long sizeBytes, String sha256Hex) {
+            this.sizeBytes = sizeBytes;
+            this.sha256Hex = sha256Hex;
+        }
+    }
+
+    private static final class DigestResult {
+        private final long sizeBytes;
+        private final String sha256Hex;
+
+        private DigestResult(long sizeBytes, String sha256Hex) {
+            this.sizeBytes = sizeBytes;
+            this.sha256Hex = sha256Hex;
+        }
+    }
+
     private static boolean containsHighRiskToken(String value) {
         return value.indexOf("frida") >= 0
                 || value.indexOf("gum-js") >= 0
@@ -1032,12 +1847,12 @@ public final class Z1Guard {
     }
 
     private static void block(String reason) {
-        Log.e(TAG, "Blocked risky runtime: " + reason);
+        Log.e(TAG, "Blocked APK integrity/runtime risk: " + reason);
         try {
             Process.killProcess(Process.myPid());
         } catch (Throwable ignored) {
         }
-        throw new SecurityException("Z1Guard blocked risky runtime: " + reason);
+        throw new SecurityException("Z1Guard blocked APK integrity/runtime risk: " + reason);
     }
 
     private static void closeQuietly(java.io.Closeable closeable) {

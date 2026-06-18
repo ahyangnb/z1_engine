@@ -650,7 +650,7 @@ class EngineMenuController extends ChangeNotifier {
 
     _isHardeningApk = true;
     _hardeningLogs.addAll([
-      '[${_timestamp()}] 开始 APK 防注入加固',
+      '[${_timestamp()}] 开始 APK 包防篡改加固',
       '[${_timestamp()}] 输入 APK：$apkPath',
       '[${_timestamp()}] 输出 APK：$outputPath',
       '[${_timestamp()}] 签名配置：${config.name}',
@@ -668,7 +668,8 @@ class EngineMenuController extends ChangeNotifier {
       }
       _hardeningLogs.addAll([
         '[${_timestamp()}] 已注入早启动防护 Provider：com.z1.guard.Z1GuardProvider',
-        '[${_timestamp()}] 已启用检测：私有目录二进制/DEX/JS、Frida/Gadget、TracerPid、异常线程、root 信号、VPN transport',
+        '[${_timestamp()}] 已启用硬校验：包名、签名证书 SHA-256、APK 条目 SHA-256 摘要基线',
+        '[${_timestamp()}] 已启用运行时检测：私有目录二进制/DEX/JS、Frida/Gadget、TracerPid、异常线程、root 信号、VPN transport',
         '[${_timestamp()}] 加固成功：${result.outputApkPath}',
       ]);
     } on ApkHardeningException catch (error) {
@@ -679,7 +680,7 @@ class EngineMenuController extends ChangeNotifier {
       _hardeningLogs.add('[${_timestamp()}] 命令启动失败：${error.message}');
     } finally {
       _isHardeningApk = false;
-      _hardeningLogs.add('[${_timestamp()}] APK 防注入加固流程结束');
+      _hardeningLogs.add('[${_timestamp()}] APK 包防篡改加固流程结束');
       notifyListeners();
     }
   }
