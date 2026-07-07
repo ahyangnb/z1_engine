@@ -10,3 +10,12 @@ const obfuscationConfigOptions = <String>[
   '字符串',
   '资源',
 ];
+
+const vipObfuscationConfigOptions = <String>[
+  '控制流平坦化',
+  '调用链重排',
+  '反调试探针',
+  '重复度扰动',
+  '资源指纹刷新',
+  '类结构重组',
+];

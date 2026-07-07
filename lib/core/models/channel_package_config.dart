@@ -2,7 +2,7 @@ class ChannelPackageConfig {
   const ChannelPackageConfig({
     this.outputDirectory = '',
     this.prefix = 'ch',
-    this.count = 10,
+    this.count = 5,
     this.startIndex = 1,
   });
 
@@ -24,7 +24,7 @@ class ChannelPackageConfig {
     return ChannelPackageConfig(
       outputDirectory: json['outputDirectory'] as String? ?? '',
       prefix: json['prefix'] as String? ?? 'ch',
-      count: json['count'] as int? ?? 10,
+      count: json['count'] as int? ?? 5,
       startIndex: json['startIndex'] as int? ?? 1,
     );
   }

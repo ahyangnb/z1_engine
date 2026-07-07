@@ -164,7 +164,71 @@ class _ChannelPackageSettings extends StatelessWidget {
               .read<EngineMenuController>()
               .updateChannelPackageOutputDirectory,
         ),
+        if (!controller.isVipServiceActive) ...[
+          const SizedBox(height: 12),
+          _VipChannelPackageBanner(
+            freeLimit: controller.freeChannelPackageLimit,
+            highlighted:
+                controller.channelPackageCount >
+                controller.freeChannelPackageLimit,
+          ),
+        ],
       ],
+    );
+  }
+}
+
+class _VipChannelPackageBanner extends StatelessWidget {
+  const _VipChannelPackageBanner({
+    required this.freeLimit,
+    required this.highlighted,
+  });
+
+  final int freeLimit;
+  final bool highlighted;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: context.read<EngineMenuController>().openVipServicePage,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: highlighted
+              ? const Color(0xFFFFFBEB)
+              : const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: highlighted
+                ? const Color(0xFFF8D36A)
+                : const Color(0xFFD6DDE8),
+          ),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(
+              Icons.workspace_premium_outlined,
+              color: Color(0xFF8A5A00),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                '免费版单次最多生成 $freeLimit 个渠道包。开通 VIP 增值服务后允许设置超过 $freeLimit 个渠道包。',
+                style: const TextStyle(
+                  color: Color(0xFF3B4351),
+                  fontWeight: FontWeight.w700,
+                  height: 1.4,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            const Icon(Icons.chevron_right_outlined, color: Color(0xFF8A5A00)),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -341,6 +405,9 @@ class _ChannelPackageActions extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hasLogs = controller.channelPackageLogs.isNotEmpty;
+    final needsVip =
+        !controller.isVipServiceActive &&
+        controller.channelPackageCount > controller.freeChannelPackageLimit;
 
     return Wrap(
       spacing: 12,
@@ -348,7 +415,9 @@ class _ChannelPackageActions extends StatelessWidget {
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         FilledButton.icon(
-          onPressed: controller.canGenerateChannelPackages
+          onPressed: needsVip
+              ? context.read<EngineMenuController>().openVipServicePage
+              : controller.canGenerateChannelPackages
               ? () {
                   context
                       .read<EngineMenuController>()
@@ -356,11 +425,19 @@ class _ChannelPackageActions extends StatelessWidget {
                 }
               : null,
           icon: Icon(
-            controller.isGeneratingChannelPackages
+            needsVip
+                ? Icons.workspace_premium_outlined
+                : controller.isGeneratingChannelPackages
                 ? Icons.hourglass_top_outlined
                 : Icons.play_arrow_outlined,
           ),
-          label: Text(controller.isGeneratingChannelPackages ? '生成中' : '开始生成'),
+          label: Text(
+            needsVip
+                ? '开通增值服务'
+                : controller.isGeneratingChannelPackages
+                ? '生成中'
+                : '开始生成',
+          ),
         ),
         OutlinedButton.icon(
           onPressed: hasLogs

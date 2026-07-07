@@ -53,12 +53,19 @@ class ObfuscationPage extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           CheckboxGrid(
-            options: obfuscationConfigOptions,
+            options: [
+              ...obfuscationConfigOptions,
+              if (controller.isVipServiceActive) ...vipObfuscationConfigOptions,
+            ],
             selectedOptions: controller.selectedObfuscationConfig,
             onChanged: context
                 .read<EngineMenuController>()
                 .toggleObfuscationOption,
           ),
+          if (!controller.isVipServiceActive) ...[
+            const SizedBox(height: 12),
+            const _VipObfuscationBanner(),
+          ],
           const SizedBox(height: 22),
           const ContactBanner(text: '定制开发请联系我们'),
           const SizedBox(height: 24),
@@ -73,6 +80,68 @@ class ObfuscationPage extends StatelessWidget {
           const SizedBox(height: 18),
           LogOutputPanel(logs: controller.obfuscationLogs),
         ],
+      ),
+    );
+  }
+}
+
+class _VipObfuscationBanner extends StatelessWidget {
+  const _VipObfuscationBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: context.read<EngineMenuController>().openVipServicePage,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFFFBEB),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xFFF8D36A)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFF1B8),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(
+                Icons.workspace_premium_outlined,
+                color: colorScheme.primary,
+              ),
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'VIP 增值混淆参数',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF1F2937),
+                    ),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    '解锁控制流平坦化、调用链重排、反调试探针、重复度扰动等更多参数，防重复度更高。',
+                    style: TextStyle(color: Color(0xFF647084), height: 1.4),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            const Icon(Icons.chevron_right_outlined, color: Color(0xFF7A4A00)),
+          ],
+        ),
       ),
     );
   }

@@ -10,6 +10,7 @@ import 'package:z1_engine/features/package/pages/package_page.dart';
 // import 'package:z1_engine/features/package_security/pages/package_security_page.dart';
 import 'package:z1_engine/features/protect/pages/protect_page.dart';
 import 'package:z1_engine/features/sign/pages/sign_page.dart';
+import 'package:z1_engine/features/vip_service/pages/vip_service_page.dart';
 import 'package:z1_engine/shared/widgets/placeholder_page.dart';
 
 class EngineHomePage extends StatelessWidget {
@@ -60,6 +61,8 @@ class _CurrentMenuContent extends StatelessWidget {
         return const PackagePage();
       case MainMenu.channelPackage:
         return const ChannelPackagePage();
+      case MainMenu.vipService:
+        return const VipServicePage();
       case MainMenu.sign:
         return const SignPage();
       // case MainMenu.packageSecurity:

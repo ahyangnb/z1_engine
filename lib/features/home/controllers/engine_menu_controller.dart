@@ -12,11 +12,13 @@ import 'package:z1_engine/core/services/apk_md5_duplication_service.dart';
 import 'package:z1_engine/core/services/android_so_hardening_service.dart';
 import 'package:z1_engine/core/services/channel_package_config_store.dart';
 import 'package:z1_engine/core/services/signing_config_store.dart';
+import 'package:z1_engine/core/services/vip_activation_store.dart';
 
 class EngineMenuController extends ChangeNotifier {
   EngineMenuController() {
     _loadSavedSigningConfigs();
     _loadSavedChannelPackageConfig();
+    _loadSavedVipActivation();
   }
 
   final ApkHardeningService _apkHardeningService = ApkHardeningService();
@@ -29,6 +31,7 @@ class EngineMenuController extends ChangeNotifier {
   final SigningConfigStore _signingConfigStore = SigningConfigStore();
   final ChannelPackageConfigStore _channelPackageConfigStore =
       ChannelPackageConfigStore();
+  final VipActivationStore _vipActivationStore = VipActivationStore();
   MainMenu _selectedMenu = MainMenu.obfuscation;
   PackageTarget _selectedObfuscationTarget = PackageTarget.android;
   PackageTarget _selectedPackageTarget = PackageTarget.android;
@@ -52,7 +55,7 @@ class EngineMenuController extends ChangeNotifier {
   String _channelPackageApkPath = '';
   String _channelPackageOutputDirectory = '';
   String _channelPackagePrefix = 'ch';
-  int _channelPackageCount = 10;
+  int _channelPackageCount = 5;
   int _channelPackageStartIndex = 1;
   String _duplicationFirstApkPath = '';
   String _duplicationSecondApkPath = '';
@@ -63,6 +66,8 @@ class EngineMenuController extends ChangeNotifier {
   bool _isApplyingNativeHardening = false;
   bool _isComparingDuplication = false;
   bool _isCheckingPackageSecurity = false;
+  String _vipActivationCode = '';
+  String _vipActivationMessage = '';
 
   MainMenu get selectedMenu => _selectedMenu;
   PackageTarget get selectedObfuscationTarget => _selectedObfuscationTarget;
@@ -110,6 +115,10 @@ class EngineMenuController extends ChangeNotifier {
       _duplicationSecondApkPath.trim().isNotEmpty;
   bool get hasPackageSecurityApkPath =>
       _packageSecurityApkPath.trim().isNotEmpty;
+  bool get isVipServiceActive => _vipActivationCode.trim().isNotEmpty;
+  String get vipActivationCode => _vipActivationCode;
+  String get vipActivationMessage => _vipActivationMessage;
+  int get freeChannelPackageLimit => 5;
 
   AndroidSigningConfig? get selectedSigningConfig {
     for (final config in _androidSigningConfigs) {
@@ -132,6 +141,8 @@ class EngineMenuController extends ChangeNotifier {
         hasChannelPackageApkPath &&
         _isApkPath(_channelPackageApkPath.trim()) &&
         _channelPackageCount > 0 &&
+        (isVipServiceActive ||
+            _channelPackageCount <= freeChannelPackageLimit) &&
         _channelPackageStartIndex > 0 &&
         _isSafeChannelPart(_channelPackagePrefix.trim());
   }
@@ -193,6 +204,9 @@ class EngineMenuController extends ChangeNotifier {
     }
     if (_channelPackageCount <= 0) {
       return '请输入大于 0 的生成数量。';
+    }
+    if (!isVipServiceActive && _channelPackageCount > freeChannelPackageLimit) {
+      return '免费渠道包单次最多生成 $freeChannelPackageLimit 个。开通增值服务后可设置超过 $freeChannelPackageLimit 个渠道包。';
     }
     if (!_isSafeChannelPart(_channelPackagePrefix.trim())) {
       return '渠道后缀仅支持字母、数字、点、下划线和短横线。';
@@ -547,6 +561,31 @@ class EngineMenuController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<bool> activateVipService(String activationCode) async {
+    final normalizedCode = activationCode.trim();
+    if (normalizedCode.isEmpty) {
+      _vipActivationMessage = '请输入激活码';
+      notifyListeners();
+      return false;
+    }
+
+    if (!_isValidVipActivationCode(normalizedCode)) {
+      _vipActivationMessage = '激活码格式不正确，请确认购买后弹出的激活码';
+      notifyListeners();
+      return false;
+    }
+
+    _vipActivationCode = normalizedCode;
+    _vipActivationMessage = '增值服务已激活';
+    await _saveVipActivation();
+    notifyListeners();
+    return true;
+  }
+
+  void openVipServicePage() {
+    selectMenu(MainMenu.vipService);
+  }
+
   void updateDuplicationFirstApkPath(String path) {
     final normalizedPath = path.trim();
     if (_duplicationFirstApkPath == normalizedPath) {
@@ -896,6 +935,13 @@ class EngineMenuController extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    if (!isVipServiceActive && _channelPackageCount > freeChannelPackageLimit) {
+      _channelPackageLogs.add(
+        '[${_timestamp()}] 免费渠道包单次最多生成 $freeChannelPackageLimit 个，请开通增值服务后继续',
+      );
+      notifyListeners();
+      return;
+    }
     if (_channelPackageCount > 10000) {
       _channelPackageLogs.add('[${_timestamp()}] 单次最多生成 10000 个渠道包');
       notifyListeners();
@@ -1230,6 +1276,34 @@ class EngineMenuController extends ChangeNotifier {
     }
   }
 
+  Future<void> _loadSavedVipActivation() async {
+    try {
+      final activationCode = await _vipActivationStore.loadActivationCode();
+      if (activationCode.trim().isEmpty) {
+        return;
+      }
+
+      _vipActivationCode = activationCode.trim();
+      _vipActivationMessage = '增值服务已激活';
+      notifyListeners();
+    } on FormatException {
+      _vipActivationMessage = '本地增值服务激活信息解析失败';
+      notifyListeners();
+    } on FileSystemException catch (error) {
+      _vipActivationMessage = '本地增值服务激活信息读取失败：${error.message}';
+      notifyListeners();
+    }
+  }
+
+  Future<void> _saveVipActivation() async {
+    try {
+      await _vipActivationStore.saveActivationCode(_vipActivationCode);
+    } on FileSystemException catch (error) {
+      _vipActivationMessage = '本地增值服务激活信息保存失败：${error.message}';
+      notifyListeners();
+    }
+  }
+
   Future<_SigningConfigValidationResult> _validateAndroidSigningConfig({
     required String keystorePath,
     required String keyAlias,
@@ -1358,6 +1432,13 @@ class EngineMenuController extends ChangeNotifier {
     return _selectedObfuscationTarget == PackageTarget.android
         ? _androidObfuscationConfig
         : _flutterObfuscationConfig;
+  }
+
+  bool _isValidVipActivationCode(String activationCode) {
+    final normalizedCode = activationCode.trim().toUpperCase();
+    return normalizedCode == 'Z1VIP200' ||
+        normalizedCode == 'VIP-200' ||
+        RegExp(r'^Z1VIP-[A-Z0-9]{6,}$').hasMatch(normalizedCode);
   }
 
   String _targetLabel(PackageTarget target) {
