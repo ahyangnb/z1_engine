@@ -145,7 +145,7 @@ class _ChannelPackageSettings extends StatelessWidget {
               icon: Icons.sell_outlined,
             ),
             _SyncedTextField(
-              value: controller.channelPackageStartIndex.toString(),
+              value: controller.channelPackageStartIndexText,
               onChanged: context
                   .read<EngineMenuController>()
                   .updateChannelPackageStartIndex,

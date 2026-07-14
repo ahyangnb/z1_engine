@@ -57,6 +57,7 @@ class EngineMenuController extends ChangeNotifier {
   String _channelPackagePrefix = 'ch';
   int _channelPackageCount = 5;
   int _channelPackageStartIndex = 1;
+  String _channelPackageStartIndexText = '1';
   String _duplicationFirstApkPath = '';
   String _duplicationSecondApkPath = '';
   String _packageSecurityApkPath = '';
@@ -98,6 +99,7 @@ class EngineMenuController extends ChangeNotifier {
   String get channelPackagePrefix => _channelPackagePrefix;
   int get channelPackageCount => _channelPackageCount;
   int get channelPackageStartIndex => _channelPackageStartIndex;
+  String get channelPackageStartIndexText => _channelPackageStartIndexText;
   String get duplicationFirstApkPath => _duplicationFirstApkPath;
   String get duplicationSecondApkPath => _duplicationSecondApkPath;
   String get packageSecurityApkPath => _packageSecurityApkPath;
@@ -549,12 +551,15 @@ class EngineMenuController extends ChangeNotifier {
   }
 
   void updateChannelPackageStartIndex(String startIndex) {
-    final parsedStartIndex = int.tryParse(startIndex.trim()) ?? 0;
-    if (_channelPackageStartIndex == parsedStartIndex) {
+    final normalizedStartIndex = startIndex.trim();
+    final parsedStartIndex = int.tryParse(normalizedStartIndex) ?? 0;
+    if (_channelPackageStartIndex == parsedStartIndex &&
+        _channelPackageStartIndexText == normalizedStartIndex) {
       return;
     }
 
     _channelPackageStartIndex = parsedStartIndex;
+    _channelPackageStartIndexText = normalizedStartIndex;
     if (parsedStartIndex > 0) {
       _saveChannelPackageConfig();
     }
@@ -1245,8 +1250,14 @@ class EngineMenuController extends ChangeNotifier {
       if (config.count > 0) {
         _channelPackageCount = config.count;
       }
-      if (config.startIndex > 0) {
+      final parsedStartIndexText =
+          int.tryParse(config.startIndexText.trim()) ?? 0;
+      if (parsedStartIndexText > 0) {
+        _channelPackageStartIndex = parsedStartIndexText;
+        _channelPackageStartIndexText = config.startIndexText.trim();
+      } else if (config.startIndex > 0) {
         _channelPackageStartIndex = config.startIndex;
+        _channelPackageStartIndexText = config.startIndex.toString();
       }
 
       _channelPackageLogs.add('[${_timestamp()}] 已加载本地渠道配置');
@@ -1268,6 +1279,7 @@ class EngineMenuController extends ChangeNotifier {
           prefix: _channelPackagePrefix.trim(),
           count: _channelPackageCount,
           startIndex: _channelPackageStartIndex,
+          startIndexText: _channelPackageStartIndexText.trim(),
         ),
       );
     } on FileSystemException catch (error) {
@@ -1723,13 +1735,12 @@ class EngineMenuController extends ChangeNotifier {
   }
 
   String _channelCodeAt(int zeroBasedIndex) {
-    final currentIndex = _channelPackageStartIndex + zeroBasedIndex;
-    final maxIndex = _channelPackageStartIndex + _channelPackageCount - 1;
-    final width = maxIndex.toString().length > 3
-        ? maxIndex.toString().length
-        : 3;
-
-    return '${_channelPackagePrefix.trim()}${currentIndex.toString().padLeft(width, '0')}';
+    return ChannelPackageConfig(
+      prefix: _channelPackagePrefix.trim(),
+      count: _channelPackageCount,
+      startIndex: _channelPackageStartIndex,
+      startIndexText: _channelPackageStartIndexText.trim(),
+    ).channelCodeAt(zeroBasedIndex);
   }
 
   String _channelPackageOutputPath(
