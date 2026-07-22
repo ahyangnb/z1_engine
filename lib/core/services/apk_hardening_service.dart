@@ -8,6 +8,230 @@ import 'package:crypto/crypto.dart';
 import 'package:z1_engine/core/models/android_signing_config.dart';
 
 class ApkHardeningService {
+  static const int _dexPartSizeBytes = 512 * 1024;
+  static const String _guardApplicationName = 'com.z1.guard.Z1GuardApplication';
+  static const String _guardProviderName = 'com.z1.guard.Z1GuardProvider';
+  static const String _guardDexName = 'classes.dex';
+  static const String _dexAssetDirectoryName = 'z1_guard/dex';
+
+  Future<ApkHardeningDexPayloadTestResult> buildEncryptedDexPayloadForTesting({
+    required Directory decodedDirectory,
+    required List<File> dexFiles,
+    required Uint8List xorKey,
+    int partSizeBytes = _dexPartSizeBytes,
+  }) async {
+    final payload = await _writeEncryptedDexPayload(
+      decodedDirectory: decodedDirectory,
+      dexFiles: dexFiles,
+      xorKey: xorKey,
+      partSizeBytes: partSizeBytes,
+    );
+    return ApkHardeningDexPayloadTestResult(
+      encodedConfig: payload.encodedConfig,
+      partCount: payload.partCount,
+      totalSizeBytes: payload.totalSizeBytes,
+      totalSha256Hex: payload.totalSha256Hex,
+      apkEntryNames: payload.apkEntryNames.toList(growable: false),
+    );
+  }
+
+  Future<Map<String, Uint8List>> decryptDexPayloadForTesting({
+    required Directory decodedDirectory,
+    required String encodedConfig,
+    required Uint8List xorKey,
+  }) async {
+    final text = utf8.decode(base64Url.decode(encodedConfig));
+    final lines = text.split(RegExp(r'\r?\n'));
+    if (lines.isEmpty) {
+      throw const ApkHardeningException('DEX 分片配置为空');
+    }
+
+    final header = lines.first.split('|');
+    if (header.length != 4 || header[0] != 'Z1DEXPROFILE' || header[1] != '1') {
+      throw const ApkHardeningException('DEX 分片配置头异常');
+    }
+    final expectedTotalSize = int.parse(header[2]);
+    final expectedTotalSha256 = header[3];
+    final assetsDirectory = Directory(
+      _joinPath(decodedDirectory.path, 'assets'),
+    );
+    final totalBytes = BytesBuilder(copy: false);
+    final result = <String, Uint8List>{};
+
+    for (final line in lines.skip(1)) {
+      if (line.isEmpty) {
+        continue;
+      }
+      final fields = line.split('|');
+      if (fields.length != 4) {
+        throw const ApkHardeningException('DEX 分片配置行异常');
+      }
+      final dexName = utf8.decode(base64Url.decode(fields[0]));
+      final expectedSize = int.parse(fields[1]);
+      final expectedSha256 = fields[2];
+      final dexBytes = BytesBuilder(copy: false);
+      for (final partText in fields[3].split(';')) {
+        if (partText.isEmpty) {
+          continue;
+        }
+        final partFields = partText.split(',');
+        if (partFields.length != 3) {
+          throw const ApkHardeningException('DEX 分片配置明细异常');
+        }
+        final assetName = utf8.decode(base64Url.decode(partFields[0]));
+        final expectedPartSize = int.parse(partFields[1]);
+        final expectedPartSha256 = partFields[2];
+        final encryptedPart = await File(
+          _joinPath(assetsDirectory.path, assetName),
+        ).readAsBytes();
+        if (encryptedPart.length != expectedPartSize ||
+            sha256.convert(encryptedPart).toString() != expectedPartSha256) {
+          throw const ApkHardeningException('DEX 加密分片摘要校验失败');
+        }
+        dexBytes.add(_xorBytes(encryptedPart, xorKey));
+      }
+      final plainDex = dexBytes.takeBytes();
+      if (plainDex.length != expectedSize ||
+          sha256.convert(plainDex).toString() != expectedSha256) {
+        throw const ApkHardeningException('DEX 明文还原校验失败');
+      }
+      totalBytes.add(plainDex);
+      result[dexName] = plainDex;
+    }
+
+    final plainTotalBytes = totalBytes.takeBytes();
+    if (plainTotalBytes.length != expectedTotalSize ||
+        sha256.convert(plainTotalBytes).toString() != expectedTotalSha256) {
+      throw const ApkHardeningException('DEX 总摘要校验失败');
+    }
+    return result;
+  }
+
+  bool shouldIgnoreIntegrityEntryForTesting(
+    String normalizedPath,
+    Set<String> ignoredEntries,
+  ) {
+    return _shouldIgnoreIntegrityEntry(normalizedPath, ignoredEntries);
+  }
+
+  Uint8List encodeStorageProfileForTesting({
+    required String packageName,
+    required List<ApkHardeningStorageProfileEntryForTesting> entries,
+    required Uint8List hmacKey,
+    required Uint8List xorKey,
+  }) {
+    final sortedEntries = [...entries]
+      ..sort((left, right) => left.path.compareTo(right.path));
+    final body = StringBuffer()
+      ..writeln(
+        [
+          'Z1STORAGEPROFILE',
+          '1',
+          base64Url.encode(utf8.encode(packageName)),
+        ].join('|'),
+      );
+
+    for (final entry in sortedEntries) {
+      body.writeln(
+        [
+          base64Url.encode(utf8.encode(entry.path)),
+          entry.sizeBytes.toString(),
+          entry.modifiedTimeMillis.toString(),
+          entry.sha256Hex,
+        ].join('|'),
+      );
+    }
+
+    final bodyBytes = Uint8List.fromList(utf8.encode(body.toString()));
+    final signature = Hmac(sha256, hmacKey).convert(bodyBytes).toString();
+    final envelopeBytes = Uint8List.fromList(
+      utf8.encode('Z1STORAGEWRAP|1|$signature\n') + bodyBytes,
+    );
+    return _xorBytes(envelopeBytes, xorKey);
+  }
+
+  bool verifyStorageProfileForTesting({
+    required Uint8List protectedProfileBytes,
+    required String packageName,
+    required List<ApkHardeningStorageProfileEntryForTesting> expectedEntries,
+    required Uint8List hmacKey,
+    required Uint8List xorKey,
+  }) {
+    try {
+      final envelope = utf8.decode(_xorBytes(protectedProfileBytes, xorKey));
+      final newlineIndex = envelope.indexOf('\n');
+      if (newlineIndex <= 0) {
+        return false;
+      }
+      final envelopeHeader = envelope.substring(0, newlineIndex).split('|');
+      if (envelopeHeader.length != 3 ||
+          envelopeHeader[0] != 'Z1STORAGEWRAP' ||
+          envelopeHeader[1] != '1') {
+        return false;
+      }
+
+      final body = envelope.substring(newlineIndex + 1);
+      final bodyBytes = Uint8List.fromList(utf8.encode(body));
+      final expectedSignature = Hmac(
+        sha256,
+        hmacKey,
+      ).convert(bodyBytes).toString();
+      if (envelopeHeader[2].toLowerCase() != expectedSignature) {
+        return false;
+      }
+
+      final lines = body.split(RegExp(r'\r?\n'));
+      final bodyHeader = lines.first.split('|');
+      if (bodyHeader.length != 3 ||
+          bodyHeader[0] != 'Z1STORAGEPROFILE' ||
+          bodyHeader[1] != '1' ||
+          utf8.decode(base64Url.decode(bodyHeader[2])) != packageName) {
+        return false;
+      }
+
+      final actualEntries =
+          <String, ApkHardeningStorageProfileEntryForTesting>{};
+      for (final line in lines.skip(1)) {
+        if (line.isEmpty) {
+          continue;
+        }
+        final fields = line.split('|');
+        if (fields.length != 4) {
+          return false;
+        }
+        final path = utf8.decode(base64Url.decode(fields[0]));
+        actualEntries[path] = ApkHardeningStorageProfileEntryForTesting(
+          path: path,
+          sizeBytes: int.parse(fields[1]),
+          modifiedTimeMillis: int.parse(fields[2]),
+          sha256Hex: fields[3],
+        );
+      }
+
+      final expectedByPath = {
+        for (final entry in expectedEntries) entry.path: entry,
+      };
+      if (actualEntries.length != expectedByPath.length) {
+        return false;
+      }
+      for (final expected in expectedByPath.entries) {
+        final actual = actualEntries[expected.key];
+        if (actual == null ||
+            actual.sizeBytes != expected.value.sizeBytes ||
+            actual.sha256Hex != expected.value.sha256Hex) {
+          return false;
+        }
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool isStorageProfileEntryPathForTesting(String relativePath) {
+    return _isStorageProfileEntryPath(relativePath);
+  }
+
   Future<ApkHardeningResult> harden({
     required String sourceApkPath,
     required String outputApkPath,
@@ -96,14 +320,29 @@ class ApkHardeningService {
         logs.add('警告：minSdk=$minSdk。早启动 Provider 注入在 Android 5.0+ 最稳定。');
       }
 
-      final nextDexIndex = _nextDexIndex(decodedDirectory);
-      final guardDexName = _dexFileName(nextDexIndex);
       logs.add('目标包名：$packageName');
-      logs.add('注入 dex：$guardDexName');
+      logs.add('注入 dex：$_guardDexName');
 
-      await manifestFile.writeAsString(
-        _injectGuardProvider(manifestContent, packageName),
+      final manifestPatch = _injectGuardBootstrap(manifestContent, packageName);
+      await manifestFile.writeAsString(manifestPatch.content);
+      logs.add(
+        'Manifest 原 Application：${manifestPatch.originalApplicationName}',
       );
+      logs.add('Guard Application 注入结果：$_guardApplicationName');
+
+      final originalDexFiles = _collectOriginalDexFiles(decodedDirectory);
+      logs.add('原始 dex 数量：${originalDexFiles.length}');
+      final dexXorKey = _secureRandomBytes(16);
+      final storageHmacKey = _secureRandomBytes(32);
+      final storageProfileXorKey = _secureRandomBytes(16);
+      final dexPayload = await _writeEncryptedDexPayload(
+        decodedDirectory: decodedDirectory,
+        dexFiles: originalDexFiles,
+        xorKey: dexXorKey,
+        partSizeBytes: _dexPartSizeBytes,
+      );
+      logs.add('dex 分片数量：${dexPayload.partCount}（默认 512KB/片）');
+      logs.add('DEX 加载策略：Android 8.0+ 内存加载；Android 5.0-7.x 私有 code_cache 临时加载');
 
       final expectedCertificateSha256 = await _readSigningCertificateSha256(
         keytoolExecutable: keytool,
@@ -113,15 +352,24 @@ class ApkHardeningService {
 
       final profileAssetName = 'z1_guard/profile.dat';
       final profileApkEntryName = 'assets/$profileAssetName';
-      final ignoredProfileEntries = {guardDexName, profileApkEntryName};
+      final ignoredProfileEntries = {
+        _guardDexName,
+        profileApkEntryName,
+        ...dexPayload.apkEntryNames,
+      };
       final placeholderConfig = _GuardBuildConfig(
         expectedPackageName: packageName,
         expectedCertificateSha256: expectedCertificateSha256,
-        guardDexName: guardDexName,
+        guardDexName: _guardDexName,
         profileAssetName: profileAssetName,
         profileApkEntryName: profileApkEntryName,
         expectedProfileSha256: '',
         profileXorKeyHex: '',
+        originalApplicationName: manifestPatch.originalApplicationName,
+        dexPayloadConfig: dexPayload.encodedConfig,
+        dexXorKeyHex: _bytesToHex(dexXorKey),
+        storageHmacKeyHex: _bytesToHex(storageHmacKey),
+        storageProfileXorKeyHex: _bytesToHex(storageProfileXorKey),
       );
       await _compileGuardDex(
         javac: javac,
@@ -139,7 +387,7 @@ class ApkHardeningService {
       await _copyGuardDex(
         guardDexDirectory: guardDexDirectory,
         decodedDirectory: decodedDirectory,
-        guardDexName: guardDexName,
+        guardDexName: _guardDexName,
       );
 
       await _runChecked(
@@ -155,7 +403,7 @@ class ApkHardeningService {
       );
       final plainProfileBytes = _encodeIntegrityProfile(
         packageName: packageName,
-        guardDexName: guardDexName,
+        guardDexName: _guardDexName,
         entries: integrityProfile.entries,
       );
       final profileXorKey = _secureRandomBytes(16);
@@ -169,16 +417,23 @@ class ApkHardeningService {
         protectedProfileBytes: protectedProfileBytes,
       );
       logs.add('包体摘要基线：${integrityProfile.entries.length} 个条目');
+      logs.add('全包产物 allowlist：未知 so/dex/asset/res/META-INF 非签名文件新增会阻断启动');
+      logs.add('SP/数据库完整性保护：shared_prefs/databases 启动校验 + 运行时签名基线刷新');
       logs.add('基线资产 SHA-256：${_shortDigest(expectedProfileSha256)}');
 
       final finalConfig = _GuardBuildConfig(
         expectedPackageName: packageName,
         expectedCertificateSha256: expectedCertificateSha256,
-        guardDexName: guardDexName,
+        guardDexName: _guardDexName,
         profileAssetName: profileAssetName,
         profileApkEntryName: profileApkEntryName,
         expectedProfileSha256: expectedProfileSha256,
         profileXorKeyHex: _bytesToHex(profileXorKey),
+        originalApplicationName: manifestPatch.originalApplicationName,
+        dexPayloadConfig: dexPayload.encodedConfig,
+        dexXorKeyHex: _bytesToHex(dexXorKey),
+        storageHmacKeyHex: _bytesToHex(storageHmacKey),
+        storageProfileXorKeyHex: _bytesToHex(storageProfileXorKey),
       );
       await _compileGuardDex(
         javac: javac,
@@ -195,7 +450,7 @@ class ApkHardeningService {
       await _copyGuardDex(
         guardDexDirectory: guardDexDirectory,
         decodedDirectory: decodedDirectory,
-        guardDexName: guardDexName,
+        guardDexName: _guardDexName,
       );
 
       await _runChecked(
@@ -239,7 +494,7 @@ class ApkHardeningService {
       );
       final finalProfileBytes = _encodeIntegrityProfile(
         packageName: packageName,
-        guardDexName: guardDexName,
+        guardDexName: _guardDexName,
         entries: finalProfile.entries,
       );
       if (!_bytesEqual(finalProfileBytes, plainProfileBytes)) {
@@ -305,6 +560,10 @@ class ApkHardeningService {
         _joinPath(
           _joinPath(_joinPath(sourceDirectory.path, 'com'), 'z1'),
           'guard/Z1GuardProvider.java',
+        ),
+        _joinPath(
+          _joinPath(_joinPath(sourceDirectory.path, 'com'), 'z1'),
+          'guard/Z1GuardApplication.java',
         ),
       ],
       logs,
@@ -402,31 +661,220 @@ class ApkHardeningService {
       _joinPath(packageDirectory.path, 'Z1GuardProvider.java'),
     ).writeAsString(_guardProviderJava);
     await File(
+      _joinPath(packageDirectory.path, 'Z1GuardApplication.java'),
+    ).writeAsString(_guardApplicationJava);
+    await File(
       _joinPath(packageDirectory.path, 'Z1Guard.java'),
     ).writeAsString(_buildGuardJava(config));
   }
 
-  String _injectGuardProvider(String manifestContent, String packageName) {
-    if (manifestContent.contains('com.z1.guard.Z1GuardProvider')) {
-      return manifestContent;
+  _GuardManifestPatch _injectGuardBootstrap(
+    String manifestContent,
+    String packageName,
+  ) {
+    final applicationMatch = RegExp(
+      r'<application\b[^>]*>',
+    ).firstMatch(manifestContent);
+    if (applicationMatch == null) {
+      throw const ApkHardeningException(
+        'AndroidManifest.xml 缺少 application 节点',
+      );
+    }
+
+    final applicationTag = applicationMatch.group(0)!;
+    final originalApplicationName = _normalizeApplicationName(
+      _readApplicationNameFromTag(applicationTag),
+      packageName,
+    );
+    final updatedApplicationTag = _replaceApplicationName(
+      applicationTag,
+      _guardApplicationName,
+    );
+    var updatedManifest = manifestContent.replaceRange(
+      applicationMatch.start,
+      applicationMatch.end,
+      updatedApplicationTag,
+    );
+
+    if (updatedManifest.contains(_guardProviderName)) {
+      return _GuardManifestPatch(
+        content: updatedManifest,
+        originalApplicationName: originalApplicationName,
+      );
     }
 
     final authorities = '$packageName.z1guard';
     final provider =
         '''
-        <provider android:name="com.z1.guard.Z1GuardProvider" android:authorities="$authorities" android:exported="false" android:initOrder="1000" />
+        <provider android:name="$_guardProviderName" android:authorities="$authorities" android:exported="false" android:initOrder="1000" />
 ''';
-    final closeApplicationIndex = manifestContent.lastIndexOf('</application>');
+    final closeApplicationIndex = updatedManifest.lastIndexOf('</application>');
     if (closeApplicationIndex < 0) {
       throw const ApkHardeningException(
         'AndroidManifest.xml 缺少 application 节点',
       );
     }
 
-    return manifestContent.replaceRange(
+    updatedManifest = updatedManifest.replaceRange(
       closeApplicationIndex,
       closeApplicationIndex,
       provider,
+    );
+    return _GuardManifestPatch(
+      content: updatedManifest,
+      originalApplicationName: originalApplicationName,
+    );
+  }
+
+  String? _readApplicationNameFromTag(String applicationTag) {
+    final match = RegExp(
+      r'\sandroid:name\s*=\s*"([^"]+)"',
+    ).firstMatch(applicationTag);
+    return match?.group(1);
+  }
+
+  String _normalizeApplicationName(
+    String? applicationName,
+    String packageName,
+  ) {
+    final normalized = (applicationName ?? '').trim();
+    if (normalized.isEmpty || normalized == _guardApplicationName) {
+      return 'android.app.Application';
+    }
+    if (normalized.startsWith('.')) {
+      return '$packageName$normalized';
+    }
+    if (!normalized.contains('.')) {
+      return '$packageName.$normalized';
+    }
+    return normalized;
+  }
+
+  String _replaceApplicationName(
+    String applicationTag,
+    String applicationName,
+  ) {
+    final namePattern = RegExp(r'\sandroid:name\s*=\s*"[^"]*"');
+    if (namePattern.hasMatch(applicationTag)) {
+      return applicationTag.replaceFirst(
+        namePattern,
+        ' android:name="$applicationName"',
+      );
+    }
+
+    final insertIndex = applicationTag.lastIndexOf('>');
+    if (insertIndex < 0) {
+      throw const ApkHardeningException('AndroidManifest.xml application 节点异常');
+    }
+    return applicationTag.replaceRange(
+      insertIndex,
+      insertIndex,
+      ' android:name="$applicationName"',
+    );
+  }
+
+  List<File> _collectOriginalDexFiles(Directory decodedDirectory) {
+    final dexPattern = RegExp(r'^classes([0-9]*)\.dex$');
+    final files =
+        decodedDirectory
+            .listSync()
+            .whereType<File>()
+            .where((file) => dexPattern.hasMatch(_lastPathSegment(file.path)))
+            .toList()
+          ..sort((left, right) {
+            return _dexSortIndex(
+              _lastPathSegment(left.path),
+            ).compareTo(_dexSortIndex(_lastPathSegment(right.path)));
+          });
+
+    if (files.isEmpty) {
+      throw const ApkHardeningException('解包后未找到原始 classes*.dex');
+    }
+    return files;
+  }
+
+  int _dexSortIndex(String fileName) {
+    final match = RegExp(r'^classes([0-9]*)\.dex$').firstMatch(fileName);
+    if (match == null) {
+      return 1 << 30;
+    }
+    return int.tryParse(match.group(1) ?? '') ?? 1;
+  }
+
+  Future<_EncryptedDexPayload> _writeEncryptedDexPayload({
+    required Directory decodedDirectory,
+    required List<File> dexFiles,
+    required Uint8List xorKey,
+    required int partSizeBytes,
+  }) async {
+    if (partSizeBytes <= 0) {
+      throw const ApkHardeningException('dex 分片大小必须大于 0');
+    }
+
+    final assetsDirectory = Directory(
+      _joinPath(decodedDirectory.path, 'assets'),
+    );
+    final dexAssetsDirectory = Directory(
+      _joinPath(assetsDirectory.path, _dexAssetDirectoryName),
+    );
+    if (dexAssetsDirectory.existsSync()) {
+      await dexAssetsDirectory.delete(recursive: true);
+    }
+    await dexAssetsDirectory.create(recursive: true);
+
+    final entries = <_EncryptedDexEntry>[];
+    final totalPlainBytes = BytesBuilder(copy: false);
+    for (var dexIndex = 0; dexIndex < dexFiles.length; dexIndex += 1) {
+      final dexFile = dexFiles[dexIndex];
+      final dexName = _lastPathSegment(dexFile.path);
+      final plainBytes = await dexFile.readAsBytes();
+      if (plainBytes.isEmpty) {
+        throw ApkHardeningException('原始 dex 为空：$dexName');
+      }
+
+      totalPlainBytes.add(plainBytes);
+      final parts = <_EncryptedDexPart>[];
+      var partIndex = 0;
+      var offset = 0;
+      while (offset < plainBytes.length) {
+        final end = min(offset + partSizeBytes, plainBytes.length);
+        final chunk = Uint8List.fromList(plainBytes.sublist(offset, end));
+        final protectedBytes = _xorBytes(chunk, xorKey);
+        final assetName =
+            '$_dexAssetDirectoryName/dex_${dexIndex.toString().padLeft(3, '0')}_part_${partIndex.toString().padLeft(4, '0')}.bin';
+        final assetFile = File(_joinPath(assetsDirectory.path, assetName));
+        await assetFile.parent.create(recursive: true);
+        await assetFile.writeAsBytes(protectedBytes, flush: true);
+        parts.add(
+          _EncryptedDexPart(
+            assetName: assetName,
+            apkEntryName: 'assets/$assetName',
+            sizeBytes: protectedBytes.length,
+            sha256Hex: sha256.convert(protectedBytes).toString(),
+          ),
+        );
+        offset += partSizeBytes;
+        partIndex += 1;
+      }
+
+      entries.add(
+        _EncryptedDexEntry(
+          name: dexName,
+          sizeBytes: plainBytes.length,
+          sha256Hex: sha256.convert(plainBytes).toString(),
+          parts: parts,
+        ),
+      );
+      await dexFile.delete();
+    }
+
+    return _EncryptedDexPayload(
+      entries: entries,
+      totalSizeBytes: entries.fold<int>(
+        0,
+        (sum, entry) => sum + entry.sizeBytes,
+      ),
+      totalSha256Hex: sha256.convert(totalPlainBytes.takeBytes()).toString(),
     );
   }
 
@@ -571,10 +1019,37 @@ class ApkHardeningService {
     if (ignoredEntries.contains(normalizedPath)) {
       return true;
     }
+    if (normalizedPath.startsWith('assets/$_dexAssetDirectoryName/')) {
+      return true;
+    }
 
-    final upperPath = normalizedPath.toUpperCase();
-    return upperPath.startsWith('META-INF/') ||
+    return _isSignatureGeneratedApkEntry(normalizedPath) ||
         normalizedPath == 'stamp-cert-sha256';
+  }
+
+  bool _isSignatureGeneratedApkEntry(String normalizedPath) {
+    final upperPath = normalizedPath.toUpperCase();
+    if (upperPath == 'META-INF/MANIFEST.MF') {
+      return true;
+    }
+    if (!upperPath.startsWith('META-INF/')) {
+      return false;
+    }
+
+    final fileName = upperPath.substring('META-INF/'.length);
+    if (fileName.contains('/')) {
+      return false;
+    }
+    return fileName.endsWith('.SF') ||
+        fileName.endsWith('.RSA') ||
+        fileName.endsWith('.DSA') ||
+        fileName.endsWith('.EC');
+  }
+
+  bool _isStorageProfileEntryPath(String relativePath) {
+    final normalized = relativePath.replaceAll(r'\', '/').trim();
+    return normalized.startsWith('shared_prefs/') ||
+        normalized.startsWith('databases/');
   }
 
   String _normalizeArchivePath(String path) {
@@ -640,10 +1115,6 @@ class ApkHardeningService {
     return '${normalized.substring(0, 16)}...';
   }
 
-  String _dexFileName(int dexIndex) {
-    return dexIndex <= 1 ? 'classes.dex' : 'classes$dexIndex.dex';
-  }
-
   String? _readPackageName(String manifestContent) {
     final match = RegExp(
       r'<manifest[^>]*\spackage="([^"]+)"',
@@ -675,33 +1146,6 @@ class ApkHardeningService {
     final output = result.stdout.toString();
     final match = RegExp(r"package: name='([^']+)'").firstMatch(output);
     return match?.group(1);
-  }
-
-  int _nextDexIndex(Directory decodedDirectory) {
-    var maxIndex = 0;
-    final dexPattern = RegExp(r'^classes([0-9]*)\.dex$');
-    final smaliPattern = RegExp(r'^smali(?:_classes([0-9]+))?$');
-    for (final entity in decodedDirectory.listSync()) {
-      final name = _lastPathSegment(entity.path);
-      final dexMatch = dexPattern.firstMatch(name);
-      if (dexMatch != null) {
-        final index = int.tryParse(dexMatch.group(1) ?? '') ?? 1;
-        if (index > maxIndex) {
-          maxIndex = index;
-        }
-        continue;
-      }
-
-      final smaliMatch = smaliPattern.firstMatch(name);
-      if (smaliMatch != null) {
-        final index = int.tryParse(smaliMatch.group(1) ?? '') ?? 1;
-        if (index > maxIndex) {
-          maxIndex = index;
-        }
-      }
-    }
-
-    return maxIndex + 1;
   }
 
   List<String> _buildSigningArgs(
@@ -1034,6 +1478,36 @@ class ApkHardeningResult {
   final List<String> logs;
 }
 
+class ApkHardeningDexPayloadTestResult {
+  const ApkHardeningDexPayloadTestResult({
+    required this.encodedConfig,
+    required this.partCount,
+    required this.totalSizeBytes,
+    required this.totalSha256Hex,
+    required this.apkEntryNames,
+  });
+
+  final String encodedConfig;
+  final int partCount;
+  final int totalSizeBytes;
+  final String totalSha256Hex;
+  final List<String> apkEntryNames;
+}
+
+class ApkHardeningStorageProfileEntryForTesting {
+  const ApkHardeningStorageProfileEntryForTesting({
+    required this.path,
+    required this.sizeBytes,
+    required this.modifiedTimeMillis,
+    required this.sha256Hex,
+  });
+
+  final String path;
+  final int sizeBytes;
+  final int modifiedTimeMillis;
+  final String sha256Hex;
+}
+
 class ApkHardeningException implements Exception {
   const ApkHardeningException(this.message);
 
@@ -1052,6 +1526,11 @@ class _GuardBuildConfig {
     required this.profileApkEntryName,
     required this.expectedProfileSha256,
     required this.profileXorKeyHex,
+    required this.originalApplicationName,
+    required this.dexPayloadConfig,
+    required this.dexXorKeyHex,
+    required this.storageHmacKeyHex,
+    required this.storageProfileXorKeyHex,
   });
 
   final String expectedPackageName;
@@ -1061,6 +1540,102 @@ class _GuardBuildConfig {
   final String profileApkEntryName;
   final String expectedProfileSha256;
   final String profileXorKeyHex;
+  final String originalApplicationName;
+  final String dexPayloadConfig;
+  final String dexXorKeyHex;
+  final String storageHmacKeyHex;
+  final String storageProfileXorKeyHex;
+}
+
+class _GuardManifestPatch {
+  const _GuardManifestPatch({
+    required this.content,
+    required this.originalApplicationName,
+  });
+
+  final String content;
+  final String originalApplicationName;
+}
+
+class _EncryptedDexPayload {
+  const _EncryptedDexPayload({
+    required this.entries,
+    required this.totalSizeBytes,
+    required this.totalSha256Hex,
+  });
+
+  final List<_EncryptedDexEntry> entries;
+  final int totalSizeBytes;
+  final String totalSha256Hex;
+
+  int get partCount {
+    return entries.fold<int>(0, (sum, entry) => sum + entry.parts.length);
+  }
+
+  Iterable<String> get apkEntryNames sync* {
+    for (final entry in entries) {
+      for (final part in entry.parts) {
+        yield part.apkEntryName;
+      }
+    }
+  }
+
+  String get encodedConfig {
+    final buffer = StringBuffer()
+      ..writeln(
+        ['Z1DEXPROFILE', '1', totalSizeBytes, totalSha256Hex].join('|'),
+      );
+
+    for (final entry in entries) {
+      final partsText = entry.parts
+          .map(
+            (part) => [
+              base64Url.encode(utf8.encode(part.assetName)),
+              part.sizeBytes.toString(),
+              part.sha256Hex,
+            ].join(','),
+          )
+          .join(';');
+      buffer.writeln(
+        [
+          base64Url.encode(utf8.encode(entry.name)),
+          entry.sizeBytes.toString(),
+          entry.sha256Hex,
+          partsText,
+        ].join('|'),
+      );
+    }
+
+    return base64Url.encode(utf8.encode(buffer.toString()));
+  }
+}
+
+class _EncryptedDexEntry {
+  const _EncryptedDexEntry({
+    required this.name,
+    required this.sizeBytes,
+    required this.sha256Hex,
+    required this.parts,
+  });
+
+  final String name;
+  final int sizeBytes;
+  final String sha256Hex;
+  final List<_EncryptedDexPart> parts;
+}
+
+class _EncryptedDexPart {
+  const _EncryptedDexPart({
+    required this.assetName,
+    required this.apkEntryName,
+    required this.sizeBytes,
+    required this.sha256Hex,
+  });
+
+  final String assetName;
+  final String apkEntryName;
+  final int sizeBytes;
+  final String sha256Hex;
 }
 
 class _ApkIntegrityProfile {
@@ -1107,6 +1682,23 @@ String _buildGuardJava(_GuardBuildConfig config) {
       .replaceAll(
         '__PROFILE_XOR_KEY_HEX__',
         _javaString(config.profileXorKeyHex),
+      )
+      .replaceAll(
+        '__ORIGINAL_APPLICATION_NAME__',
+        _javaString(config.originalApplicationName),
+      )
+      .replaceAll(
+        '__DEX_PAYLOAD_CONFIG__',
+        _javaString(config.dexPayloadConfig),
+      )
+      .replaceAll('__DEX_XOR_KEY_HEX__', _javaString(config.dexXorKeyHex))
+      .replaceAll(
+        '__STORAGE_HMAC_KEY_HEX__',
+        _javaString(config.storageHmacKeyHex),
+      )
+      .replaceAll(
+        '__STORAGE_PROFILE_XOR_KEY_HEX__',
+        _javaString(config.storageProfileXorKeyHex),
       );
 }
 
@@ -1156,6 +1748,34 @@ public final class Z1GuardProvider extends ContentProvider {
 }
 ''';
 
+const _guardApplicationJava = r'''
+package com.z1.guard;
+
+import android.app.Application;
+import android.content.Context;
+
+public final class Z1GuardApplication extends Application {
+    private Application delegate;
+
+    @Override
+    protected void attachBaseContext(Context base) {
+        super.attachBaseContext(base);
+        Z1Guard.installShell(base);
+        delegate = Z1Guard.createOriginalApplication(base, this);
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        Z1Guard.init(this);
+        if (delegate != null) {
+            delegate.onCreate();
+        }
+        Z1Guard.startStorageProtection(delegate != null ? delegate : this);
+    }
+}
+''';
+
 const _guardJavaTemplate = r'''
 package com.z1.guard;
 
@@ -1169,24 +1789,40 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.os.Build;
+import android.os.FileObserver;
 import android.os.Process;
 import android.util.Base64;
 import android.util.Log;
+import dalvik.system.DexClassLoader;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.InputStream;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 public final class Z1Guard {
     private static final String TAG = "Z1Guard";
@@ -1197,8 +1833,29 @@ public final class Z1Guard {
     private static final String PROFILE_APK_ENTRY_NAME = __PROFILE_APK_ENTRY_NAME__;
     private static final String EXPECTED_PROFILE_SHA256 = __EXPECTED_PROFILE_SHA256__;
     private static final String PROFILE_XOR_KEY_HEX = __PROFILE_XOR_KEY_HEX__;
+    private static final String ORIGINAL_APPLICATION_NAME = __ORIGINAL_APPLICATION_NAME__;
+    private static final String DEX_PAYLOAD_CONFIG = __DEX_PAYLOAD_CONFIG__;
+    private static final String DEX_XOR_KEY_HEX = __DEX_XOR_KEY_HEX__;
+    private static final String STORAGE_HMAC_KEY_HEX = __STORAGE_HMAC_KEY_HEX__;
+    private static final String STORAGE_PROFILE_XOR_KEY_HEX = __STORAGE_PROFILE_XOR_KEY_HEX__;
     private static final int PROFILE_READ_LIMIT_BYTES = 16 * 1024 * 1024;
+    private static final int DEX_PART_READ_LIMIT_BYTES = 2 * 1024 * 1024;
+    private static final int STORAGE_PROFILE_READ_LIMIT_BYTES = 2 * 1024 * 1024;
+    private static final int STORAGE_FILE_OBSERVER_MASK = FileObserver.CREATE
+            | FileObserver.DELETE
+            | FileObserver.MODIFY
+            | FileObserver.CLOSE_WRITE
+            | FileObserver.MOVED_FROM
+            | FileObserver.MOVED_TO
+            | FileObserver.ATTRIB
+            | FileObserver.DELETE_SELF
+            | FileObserver.MOVE_SELF;
     private static volatile boolean initialized;
+    private static volatile boolean shellInstalled;
+    private static volatile boolean storageProtectionStarted;
+    private static volatile boolean storageRefreshScheduled;
+    private static final ArrayList<FileObserver> storageObservers = new ArrayList<FileObserver>();
+    private static final HashSet<String> storageObservedPaths = new HashSet<String>();
 
     private Z1Guard() {
     }
@@ -1213,23 +1870,415 @@ public final class Z1Guard {
         if (appContext == null) {
             appContext = context;
         }
+        installShell(appContext);
 
         StringBuilder reasons = new StringBuilder();
         int score = 0;
         score += safeCheckPackageName(appContext, reasons);
         score += safeCheckSigningCertificate(appContext, reasons);
         score += safeCheckApkIntegrity(appContext, reasons);
+        score += safeCheckStorageIntegrity(appContext, reasons);
         score += safeCheckDebuggable(appContext, reasons);
         score += safeCheckTracerPid(reasons);
         score += safeCheckPrivateFiles(appContext, reasons);
         score += safeCheckProcMaps(reasons);
         score += safeCheckThreads(reasons);
+        score += safeCheckHookClassesAndStack(reasons);
         score += safeCheckRootSignals(reasons);
         score += safeCheckVpn(appContext, reasons);
 
         if (score >= 6) {
             block(reasons.toString());
         }
+    }
+
+    public static void installShell(Context context) {
+        if (context == null || shellInstalled) {
+            return;
+        }
+
+        synchronized (Z1Guard.class) {
+            if (shellInstalled) {
+                return;
+            }
+            if (DEX_PAYLOAD_CONFIG.length() == 0 || DEX_XOR_KEY_HEX.length() == 0) {
+                shellInstalled = true;
+                return;
+            }
+
+            try {
+                Context appContext = context.getApplicationContext();
+                if (appContext == null) {
+                    appContext = context;
+                }
+
+                DexLoadResult loadResult = loadDexPayload(appContext);
+                if (loadResult.dexBytes.isEmpty()) {
+                    throw new SecurityException("empty dex payload");
+                }
+
+                ClassLoader targetLoader = appContext.getClassLoader();
+                if (targetLoader == null) {
+                    targetLoader = Z1Guard.class.getClassLoader();
+                }
+                ClassLoader payloadLoader = Build.VERSION.SDK_INT >= 26
+                        ? createMemoryDexLoader(loadResult.dexBytes, targetLoader)
+                        : createFileDexLoader(appContext, loadResult.dexBytes, targetLoader);
+                injectDexElements(targetLoader, payloadLoader);
+                shellInstalled = true;
+            } catch (Throwable error) {
+                block("dex-shell-load-error=" + error.getClass().getSimpleName());
+            }
+        }
+    }
+
+    public static Application createOriginalApplication(Context base, Application guardApplication) {
+        if (base == null) {
+            return null;
+        }
+        String originalName = ORIGINAL_APPLICATION_NAME;
+        if (originalName.length() == 0
+                || "android.app.Application".equals(originalName)
+                || "com.z1.guard.Z1GuardApplication".equals(originalName)) {
+            return null;
+        }
+
+        try {
+            ClassLoader loader = base.getClassLoader();
+            if (loader == null) {
+                loader = Z1Guard.class.getClassLoader();
+            }
+            Class<?> applicationClass = Class.forName(originalName, true, loader);
+            Object instance = applicationClass.newInstance();
+            if (!(instance instanceof Application)) {
+                throw new SecurityException("not application");
+            }
+            Application application = (Application) instance;
+            Method attach = Application.class.getDeclaredMethod("attach", Context.class);
+            attach.setAccessible(true);
+            attach.invoke(application, base);
+            replaceRuntimeApplication(base, guardApplication, application);
+            return application;
+        } catch (Throwable error) {
+            block("original-application-error=" + error.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static void replaceRuntimeApplication(
+            Context base,
+            Application guardApplication,
+            Application originalApplication
+    ) {
+        if (base == null || originalApplication == null) {
+            return;
+        }
+
+        try {
+            Object loadedApk = readOptionalField(base, "mPackageInfo");
+            if (loadedApk != null) {
+                writeOptionalField(loadedApk, "mApplication", originalApplication);
+                Object appInfo = readOptionalField(loadedApk, "mApplicationInfo");
+                if (appInfo instanceof ApplicationInfo) {
+                    ((ApplicationInfo) appInfo).className = ORIGINAL_APPLICATION_NAME;
+                }
+            }
+
+            ApplicationInfo baseInfo = base.getApplicationInfo();
+            if (baseInfo != null) {
+                baseInfo.className = ORIGINAL_APPLICATION_NAME;
+            }
+
+            Object activityThread = currentActivityThread(base);
+            if (activityThread != null) {
+                Object initialApplication = readOptionalField(activityThread, "mInitialApplication");
+                if (initialApplication == null || initialApplication == guardApplication) {
+                    writeOptionalField(activityThread, "mInitialApplication", originalApplication);
+                }
+
+                Object allApplications = readOptionalField(activityThread, "mAllApplications");
+                if (allApplications instanceof List) {
+                    List applications = (List) allApplications;
+                    boolean replaced = false;
+                    for (int index = 0; index < applications.size(); index++) {
+                        if (applications.get(index) == guardApplication) {
+                            applications.set(index, originalApplication);
+                            replaced = true;
+                        }
+                    }
+                    if (!replaced && !applications.contains(originalApplication)) {
+                        applications.add(originalApplication);
+                    }
+                }
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "Original application runtime swap failed", error);
+        }
+    }
+
+    private static Object currentActivityThread(Context base) {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method method = activityThreadClass.getDeclaredMethod("currentActivityThread");
+            method.setAccessible(true);
+            Object thread = method.invoke(null);
+            if (thread != null) {
+                return thread;
+            }
+        } catch (Throwable ignored) {
+        }
+        return readOptionalField(base, "mMainThread");
+    }
+
+    private static DexLoadResult loadDexPayload(Context context) throws Exception {
+        byte[] configBytes = Base64.decode(DEX_PAYLOAD_CONFIG, Base64.URL_SAFE | Base64.NO_WRAP);
+        String text = new String(configBytes, "UTF-8");
+        String[] lines = text.split("\\r?\\n");
+        if (lines.length == 0) {
+            throw new SecurityException("empty dex profile");
+        }
+
+        String[] header = lines[0].split("\\|", -1);
+        if (header.length != 4 || !"Z1DEXPROFILE".equals(header[0]) || !"1".equals(header[1])) {
+            throw new SecurityException("bad dex profile header");
+        }
+        long expectedTotalSize = Long.parseLong(header[2]);
+        String expectedTotalSha256 = header[3].toLowerCase(Locale.US);
+        byte[] xorKey = hexToBytes(DEX_XOR_KEY_HEX);
+        if (xorKey.length == 0) {
+            throw new SecurityException("empty dex key");
+        }
+
+        MessageDigest totalDigest = MessageDigest.getInstance("SHA-256");
+        long actualTotalSize = 0;
+        ArrayList<byte[]> dexBytes = new ArrayList<byte[]>();
+        for (int index = 1; index < lines.length; index++) {
+            String line = lines[index];
+            if (line == null || line.length() == 0) {
+                continue;
+            }
+
+            DexEntry entry = parseDexEntry(line);
+            ByteArrayOutputStream dexOutput = new ByteArrayOutputStream();
+            for (int partIndex = 0; partIndex < entry.parts.size(); partIndex++) {
+                DexPart part = entry.parts.get(partIndex);
+                byte[] encryptedPart = readAssetBytes(context, part.assetName, DEX_PART_READ_LIMIT_BYTES);
+                if (encryptedPart.length != part.sizeBytes) {
+                    throw new SecurityException("dex part size mismatch");
+                }
+                String encryptedDigest = sha256Hex(encryptedPart);
+                if (!part.sha256Hex.equalsIgnoreCase(encryptedDigest)) {
+                    throw new SecurityException("dex part sha mismatch");
+                }
+                dexOutput.write(xorBytes(encryptedPart, xorKey));
+            }
+
+            byte[] dex = dexOutput.toByteArray();
+            if (dex.length != entry.sizeBytes) {
+                throw new SecurityException("dex size mismatch");
+            }
+            String dexDigest = sha256Hex(dex);
+            if (!entry.sha256Hex.equalsIgnoreCase(dexDigest)) {
+                throw new SecurityException("dex sha mismatch");
+            }
+            totalDigest.update(dex);
+            actualTotalSize += dex.length;
+            dexBytes.add(dex);
+        }
+
+        if (dexBytes.isEmpty()) {
+            throw new SecurityException("empty dex entries");
+        }
+        String actualTotalSha256 = bytesToHex(totalDigest.digest());
+        if (actualTotalSize != expectedTotalSize || !expectedTotalSha256.equalsIgnoreCase(actualTotalSha256)) {
+            throw new SecurityException("dex total digest mismatch");
+        }
+
+        return new DexLoadResult(dexBytes);
+    }
+
+    private static DexEntry parseDexEntry(String line) throws Exception {
+        String[] parts = line.split("\\|", -1);
+        if (parts.length != 4) {
+            throw new SecurityException("bad dex profile line");
+        }
+
+        String name = new String(
+                Base64.decode(parts[0], Base64.URL_SAFE | Base64.NO_WRAP),
+                "UTF-8"
+        );
+        long size = Long.parseLong(parts[1]);
+        String sha = parts[2].toLowerCase(Locale.US);
+        String[] partTokens = parts[3].split(";", -1);
+        ArrayList<DexPart> dexParts = new ArrayList<DexPart>();
+        for (int index = 0; index < partTokens.length; index++) {
+            String token = partTokens[index];
+            if (token == null || token.length() == 0) {
+                continue;
+            }
+            dexParts.add(parseDexPart(token));
+        }
+        if (name.length() == 0 || size <= 0 || dexParts.isEmpty()) {
+            throw new SecurityException("invalid dex entry");
+        }
+        return new DexEntry(name, size, sha, dexParts);
+    }
+
+    private static DexPart parseDexPart(String text) throws Exception {
+        String[] parts = text.split(",", -1);
+        if (parts.length != 3) {
+            throw new SecurityException("bad dex part line");
+        }
+        String assetName = new String(
+                Base64.decode(parts[0], Base64.URL_SAFE | Base64.NO_WRAP),
+                "UTF-8"
+        );
+        long size = Long.parseLong(parts[1]);
+        String sha = parts[2].toLowerCase(Locale.US);
+        if (assetName.length() == 0 || size <= 0) {
+            throw new SecurityException("invalid dex part");
+        }
+        return new DexPart(assetName, size, sha);
+    }
+
+    private static ClassLoader createMemoryDexLoader(List<byte[]> dexBytes, ClassLoader parent) throws Exception {
+        ByteBuffer[] buffers = new ByteBuffer[dexBytes.size()];
+        for (int index = 0; index < dexBytes.size(); index++) {
+            buffers[index] = ByteBuffer.wrap(dexBytes.get(index));
+        }
+
+        Class<?> loaderClass = Class.forName("dalvik.system.InMemoryDexClassLoader");
+        Constructor<?> constructor = loaderClass.getConstructor(ByteBuffer[].class, ClassLoader.class);
+        return (ClassLoader) constructor.newInstance(new Object[]{buffers, parent});
+    }
+
+    private static ClassLoader createFileDexLoader(Context context, List<byte[]> dexBytes, ClassLoader parent) throws Exception {
+        File cacheRoot = getCodeCacheDirCompat(context);
+        File dexDir = new File(cacheRoot, "z1_guard_dex");
+        File optimizedDir = new File(cacheRoot, "z1_guard_opt");
+        if (!dexDir.exists() && !dexDir.mkdirs()) {
+            throw new SecurityException("create dex cache failed");
+        }
+        if (!optimizedDir.exists() && !optimizedDir.mkdirs()) {
+            throw new SecurityException("create optimized cache failed");
+        }
+
+        ArrayList<File> tempFiles = new ArrayList<File>();
+        StringBuilder dexPath = new StringBuilder();
+        for (int index = 0; index < dexBytes.size(); index++) {
+            byte[] bytes = dexBytes.get(index);
+            File dexFile = new File(dexDir, "payload_" + index + "_" + trimDigest(sha256Hex(bytes)) + ".dex");
+            FileOutputStream output = null;
+            try {
+                output = new FileOutputStream(dexFile);
+                output.write(bytes);
+                output.flush();
+            } finally {
+                closeQuietly(output);
+            }
+            if (dexPath.length() > 0) {
+                dexPath.append(File.pathSeparator);
+            }
+            dexPath.append(dexFile.getAbsolutePath());
+            tempFiles.add(dexFile);
+        }
+
+        ClassLoader loader = new DexClassLoader(
+                dexPath.toString(),
+                optimizedDir.getAbsolutePath(),
+                null,
+                parent
+        );
+        for (int index = 0; index < tempFiles.size(); index++) {
+            try {
+                tempFiles.get(index).delete();
+            } catch (Throwable ignored) {
+            }
+        }
+        return loader;
+    }
+
+    private static File getCodeCacheDirCompat(Context context) {
+        File directory = Build.VERSION.SDK_INT >= 21 ? context.getCodeCacheDir() : context.getCacheDir();
+        if (directory == null) {
+            directory = context.getCacheDir();
+        }
+        if (directory == null) {
+            directory = context.getFilesDir();
+        }
+        if (directory == null) {
+            throw new SecurityException("missing cache dir");
+        }
+        return directory;
+    }
+
+    private static void injectDexElements(ClassLoader targetLoader, ClassLoader payloadLoader) throws Exception {
+        Object targetPathList = readField(targetLoader, "pathList");
+        Object payloadPathList = readField(payloadLoader, "pathList");
+        Field targetDexElementsField = findField(targetPathList.getClass(), "dexElements");
+        Field payloadDexElementsField = findField(payloadPathList.getClass(), "dexElements");
+        Object targetElements = targetDexElementsField.get(targetPathList);
+        Object payloadElements = payloadDexElementsField.get(payloadPathList);
+        targetDexElementsField.set(targetPathList, mergeArrays(targetElements, payloadElements));
+    }
+
+    private static Object mergeArrays(Object first, Object second) {
+        int firstLength = Array.getLength(first);
+        int secondLength = Array.getLength(second);
+        Class<?> componentType = first.getClass().getComponentType();
+        Object merged = Array.newInstance(componentType, firstLength + secondLength);
+        for (int index = 0; index < firstLength; index++) {
+            Array.set(merged, index, Array.get(first, index));
+        }
+        for (int index = 0; index < secondLength; index++) {
+            Array.set(merged, firstLength + index, Array.get(second, index));
+        }
+        return merged;
+    }
+
+    private static Object readField(Object instance, String name) throws Exception {
+        Field field = findField(instance.getClass(), name);
+        return field.get(instance);
+    }
+
+    private static Object readOptionalField(Object instance, String name) {
+        if (instance == null) {
+            return null;
+        }
+        try {
+            Field field = findField(instance.getClass(), name);
+            return field.get(instance);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean writeOptionalField(Object instance, String name, Object value) {
+        if (instance == null) {
+            return false;
+        }
+        try {
+            Field field = findField(instance.getClass(), name);
+            field.set(instance, value);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static Field findField(Class<?> type, String name) throws NoSuchFieldException {
+        Class<?> current = type;
+        while (current != null) {
+            try {
+                Field field = current.getDeclaredField(name);
+                field.setAccessible(true);
+                return field;
+            } catch (NoSuchFieldException ignored) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(name);
     }
 
     private static int safeCheckPackageName(Context context, StringBuilder reasons) {
@@ -1333,6 +2382,384 @@ public final class Z1Guard {
         }
     }
 
+    private static int safeCheckStorageIntegrity(Context context, StringBuilder reasons) {
+        if (STORAGE_HMAC_KEY_HEX.length() == 0 || STORAGE_PROFILE_XOR_KEY_HEX.length() == 0) {
+            return 0;
+        }
+
+        try {
+            File profileFile = getStorageProfileFile(context);
+            if (!profileFile.exists()) {
+                if (isStorageProfileInitialized(context)) {
+                    appendReason(reasons, "storage-profile-missing");
+                    return 10;
+                }
+                // First install or first upgrade from an unprotected/third-party-protected build:
+                // defer baseline creation until the original Application has completed its own
+                // startup migrations and first-run writes.
+                return 0;
+            }
+
+            byte[] protectedProfile = readFileBytes(profileFile, STORAGE_PROFILE_READ_LIMIT_BYTES);
+            Map<String, StorageEntry> expectedEntries = parseStorageProfile(context, protectedProfile);
+            Map<String, StorageEntry> actualEntries = scanStorageEntries(context);
+            HashMap<String, StorageEntry> remaining = new HashMap<String, StorageEntry>(expectedEntries);
+
+            for (StorageEntry actualEntry : actualEntries.values()) {
+                StorageEntry expectedEntry = remaining.remove(actualEntry.path);
+                if (expectedEntry == null) {
+                    appendReason(reasons, "storage-unexpected=" + trimReason(actualEntry.path));
+                    return 10;
+                }
+                if (expectedEntry.sizeBytes != actualEntry.sizeBytes) {
+                    appendReason(reasons, "storage-size=" + trimReason(actualEntry.path));
+                    return 10;
+                }
+                if (!expectedEntry.sha256Hex.equalsIgnoreCase(actualEntry.sha256Hex)) {
+                    appendReason(reasons, "storage-sha256=" + trimReason(actualEntry.path));
+                    return 10;
+                }
+            }
+
+            if (!remaining.isEmpty()) {
+                appendReason(reasons, "storage-missing=" + trimReason(remaining.keySet().iterator().next()));
+                return 10;
+            }
+        } catch (Throwable error) {
+            appendReason(reasons, "storage-check-error=" + error.getClass().getSimpleName());
+            return 10;
+        }
+        return 0;
+    }
+
+    public static void startStorageProtection(Context context) {
+        if (context == null || storageProtectionStarted
+                || STORAGE_HMAC_KEY_HEX.length() == 0
+                || STORAGE_PROFILE_XOR_KEY_HEX.length() == 0) {
+            return;
+        }
+
+        synchronized (Z1Guard.class) {
+            if (storageProtectionStarted) {
+                return;
+            }
+            Context appContext = context.getApplicationContext();
+            if (appContext == null) {
+                appContext = context;
+            }
+            try {
+                ensureStorageObservers(appContext);
+                scheduleStorageProfileRefresh(appContext, 0);
+                storageProtectionStarted = true;
+            } catch (Throwable error) {
+                Log.w(TAG, "Storage protection observer start failed", error);
+            }
+        }
+    }
+
+    private static void ensureStorageObservers(final Context context) {
+        File dataDir = getDataDirCompat(context);
+        observeStoragePath(context, dataDir);
+        observeStoragePath(context, new File(dataDir, "shared_prefs"));
+        observeStoragePath(context, new File(dataDir, "databases"));
+    }
+
+    private static void observeStoragePath(final Context context, File directory) {
+        if (directory == null || !directory.exists() || !directory.isDirectory()) {
+            return;
+        }
+        try {
+            final String path = directory.getCanonicalPath();
+            synchronized (storageObservers) {
+                if (!storageObservedPaths.add(path)) {
+                    return;
+                }
+                FileObserver observer = new FileObserver(path, STORAGE_FILE_OBSERVER_MASK) {
+                    @Override
+                    public void onEvent(int event, String childPath) {
+                        ensureStorageObservers(context);
+                        scheduleStorageProfileRefresh(context, 800);
+                    }
+                };
+                observer.startWatching();
+                storageObservers.add(observer);
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "Storage observer failed", error);
+        }
+    }
+
+    private static void scheduleStorageProfileRefresh(final Context context, final long delayMillis) {
+        synchronized (Z1Guard.class) {
+            if (storageRefreshScheduled) {
+                return;
+            }
+            storageRefreshScheduled = true;
+        }
+
+        Thread thread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (delayMillis > 0) {
+                        Thread.sleep(delayMillis);
+                    }
+                    writeStorageProfile(context);
+                } catch (Throwable error) {
+                    Log.w(TAG, "Storage profile refresh failed", error);
+                } finally {
+                    synchronized (Z1Guard.class) {
+                        storageRefreshScheduled = false;
+                    }
+                }
+            }
+        }, "z1-storage-profile");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private static boolean isStorageProfileInitialized(Context context) {
+        return getStorageMarkerFile(context).exists() || getStorageMirrorMarkerFile(context).exists();
+    }
+
+    private static void writeStorageProfile(Context context) throws Exception {
+        File profileFile = getStorageProfileFile(context);
+        File profileDir = profileFile.getParentFile();
+        if (profileDir != null && !profileDir.exists() && !profileDir.mkdirs()) {
+            throw new SecurityException("create storage profile dir failed");
+        }
+
+        Map<String, StorageEntry> entries = scanStorageEntries(context);
+        byte[] protectedProfile = encodeStorageProfile(context, entries);
+        writeFileBytes(profileFile, protectedProfile);
+        writeFileBytes(getStorageMarkerFile(context), new byte[]{'1'});
+        writeFileBytes(getStorageMirrorMarkerFile(context), new byte[]{'1'});
+    }
+
+    private static byte[] encodeStorageProfile(Context context, Map<String, StorageEntry> entries) throws Exception {
+        ArrayList<StorageEntry> sortedEntries = new ArrayList<StorageEntry>(entries.values());
+        Collections.sort(sortedEntries, new Comparator<StorageEntry>() {
+            @Override
+            public int compare(StorageEntry left, StorageEntry right) {
+                return left.path.compareTo(right.path);
+            }
+        });
+
+        StringBuilder body = new StringBuilder();
+        body.append("Z1STORAGEPROFILE|1|")
+                .append(base64Url(context.getPackageName()))
+                .append('\n');
+        for (int index = 0; index < sortedEntries.size(); index++) {
+            StorageEntry entry = sortedEntries.get(index);
+            body.append(base64Url(entry.path))
+                    .append('|')
+                    .append(entry.sizeBytes)
+                    .append('|')
+                    .append(entry.modifiedTimeMillis)
+                    .append('|')
+                    .append(entry.sha256Hex)
+                    .append('\n');
+        }
+
+        StorageKeys storageKeys = getStorageKeys(context, true);
+        byte[] bodyBytes = body.toString().getBytes("UTF-8");
+        String signature = hmacSha256Hex(bodyBytes, storageKeys.hmacKey);
+        byte[] envelopeBytes = ("Z1STORAGEWRAP|1|" + signature + "\n" + body.toString()).getBytes("UTF-8");
+        return xorBytes(envelopeBytes, storageKeys.xorKey);
+    }
+
+    private static Map<String, StorageEntry> parseStorageProfile(Context context, byte[] protectedProfile) throws Exception {
+        StorageKeys storageKeys = getStorageKeys(context, false);
+        byte[] envelopeBytes = xorBytes(protectedProfile, storageKeys.xorKey);
+        String envelope = new String(envelopeBytes, "UTF-8");
+        int firstNewline = envelope.indexOf('\n');
+        if (firstNewline <= 0) {
+            throw new SecurityException("bad storage envelope");
+        }
+
+        String[] envelopeHeader = envelope.substring(0, firstNewline).split("\\|", -1);
+        if (envelopeHeader.length != 3
+                || !"Z1STORAGEWRAP".equals(envelopeHeader[0])
+                || !"1".equals(envelopeHeader[1])) {
+            throw new SecurityException("bad storage envelope header");
+        }
+
+        String body = envelope.substring(firstNewline + 1);
+        byte[] bodyBytes = body.getBytes("UTF-8");
+        String expectedSignature = hmacSha256Hex(bodyBytes, storageKeys.hmacKey);
+        if (!expectedSignature.equalsIgnoreCase(envelopeHeader[2])) {
+            throw new SecurityException("bad storage profile hmac");
+        }
+
+        String[] lines = body.split("\\r?\\n");
+        if (lines.length == 0) {
+            throw new SecurityException("empty storage profile");
+        }
+
+        String[] bodyHeader = lines[0].split("\\|", -1);
+        if (bodyHeader.length != 3
+                || !"Z1STORAGEPROFILE".equals(bodyHeader[0])
+                || !"1".equals(bodyHeader[1])) {
+            throw new SecurityException("bad storage profile header");
+        }
+        String packageName = new String(
+                Base64.decode(bodyHeader[2], Base64.URL_SAFE | Base64.NO_WRAP),
+                "UTF-8"
+        );
+        if (!context.getPackageName().equals(packageName)) {
+            throw new SecurityException("bad storage package");
+        }
+
+        HashMap<String, StorageEntry> entries = new HashMap<String, StorageEntry>();
+        for (int index = 1; index < lines.length; index++) {
+            String line = lines[index];
+            if (line == null || line.length() == 0) {
+                continue;
+            }
+            String[] parts = line.split("\\|", -1);
+            if (parts.length != 4) {
+                throw new SecurityException("bad storage profile line");
+            }
+            String path = new String(
+                    Base64.decode(parts[0], Base64.URL_SAFE | Base64.NO_WRAP),
+                    "UTF-8"
+            );
+            StorageEntry entry = new StorageEntry(
+                    path,
+                    Long.parseLong(parts[1]),
+                    Long.parseLong(parts[2]),
+                    parts[3].toLowerCase(Locale.US)
+            );
+            if (entries.put(path, entry) != null) {
+                throw new SecurityException("duplicate storage path");
+            }
+        }
+        return entries;
+    }
+
+    private static Map<String, StorageEntry> scanStorageEntries(Context context) throws Exception {
+        HashMap<String, StorageEntry> entries = new HashMap<String, StorageEntry>();
+        File dataDir = getDataDirCompat(context);
+        scanStorageDirectory(new File(dataDir, "shared_prefs"), "shared_prefs", 0, entries);
+        scanStorageDirectory(new File(dataDir, "databases"), "databases", 0, entries);
+        return entries;
+    }
+
+    private static void scanStorageDirectory(
+            File directory,
+            String relativePrefix,
+            int depth,
+            HashMap<String, StorageEntry> entries
+    ) throws Exception {
+        if (directory == null || !directory.exists() || !directory.isDirectory() || depth > 3) {
+            return;
+        }
+
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (int index = 0; index < files.length && index < 2000; index++) {
+            File file = files[index];
+            if (file == null) {
+                continue;
+            }
+            String relativePath = relativePrefix + "/" + file.getName();
+            if (file.isDirectory()) {
+                scanStorageDirectory(file, relativePath, depth + 1, entries);
+                continue;
+            }
+            if (!file.isFile()) {
+                continue;
+            }
+            entries.put(relativePath, digestStorageFile(file, relativePath));
+        }
+    }
+
+    private static StorageEntry digestStorageFile(File file, String relativePath) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        FileInputStream input = null;
+        try {
+            input = new FileInputStream(file);
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
+            }
+        } finally {
+            closeQuietly(input);
+        }
+        return new StorageEntry(
+                relativePath.replace('\\', '/'),
+                file.length(),
+                file.lastModified(),
+                bytesToHex(digest.digest())
+        );
+    }
+
+    private static StorageKeys getStorageKeys(Context context, boolean allowCreate) throws Exception {
+        File keyFile = getStorageKeyFile(context);
+        if (keyFile.exists()) {
+            byte[] bytes = readFileBytes(keyFile, 128);
+            if (bytes.length != 48) {
+                throw new SecurityException("bad storage key");
+            }
+            return new StorageKeys(
+                    copyBytes(bytes, 0, 32),
+                    copyBytes(bytes, 32, 16)
+            );
+        }
+
+        if (!allowCreate) {
+            throw new SecurityException("storage key missing");
+        }
+
+        byte[] bytes = new byte[48];
+        new SecureRandom().nextBytes(bytes);
+        writeFileBytes(keyFile, bytes);
+        return new StorageKeys(
+                copyBytes(bytes, 0, 32),
+                copyBytes(bytes, 32, 16)
+        );
+    }
+
+    private static byte[] copyBytes(byte[] bytes, int offset, int length) {
+        byte[] result = new byte[length];
+        System.arraycopy(bytes, offset, result, 0, length);
+        return result;
+    }
+
+    private static File getStorageProfileFile(Context context) {
+        return new File(getStorageGuardDirectory(context), "storage_profile.dat");
+    }
+
+    private static File getStorageKeyFile(Context context) {
+        return new File(getStorageGuardDirectory(context), "storage_key.dat");
+    }
+
+    private static File getStorageMarkerFile(Context context) {
+        return new File(getStorageGuardDirectory(context), "storage_initialized.flag");
+    }
+
+    private static File getStorageMirrorMarkerFile(Context context) {
+        File filesDir = context.getFilesDir();
+        if (filesDir == null) {
+            filesDir = getStorageGuardDirectory(context);
+        }
+        return new File(filesDir, ".z1_guard_storage_initialized");
+    }
+
+    private static File getStorageGuardDirectory(Context context) {
+        File base = Build.VERSION.SDK_INT >= 21 ? context.getNoBackupFilesDir() : context.getFilesDir();
+        if (base == null) {
+            base = context.getFilesDir();
+        }
+        if (base == null) {
+            throw new SecurityException("missing storage profile dir");
+        }
+        return new File(base, "z1_guard");
+    }
+
     private static Map<String, ExpectedEntry> parseIntegrityProfile(byte[] profileBytes) throws Exception {
         String text = new String(profileBytes, "UTF-8");
         String[] lines = text.split("\\r?\\n");
@@ -1428,11 +2855,30 @@ public final class Z1Guard {
     }
 
     private static boolean shouldIgnoreApkEntry(String name) {
-        String upper = name.toUpperCase(Locale.US);
         return GUARD_DEX_NAME.equals(name)
                 || PROFILE_APK_ENTRY_NAME.equals(name)
-                || upper.startsWith("META-INF/")
+                || name.startsWith("assets/z1_guard/dex/")
+                || isSignatureGeneratedApkEntry(name)
                 || "stamp-cert-sha256".equals(name);
+    }
+
+    private static boolean isSignatureGeneratedApkEntry(String name) {
+        String upper = name.toUpperCase(Locale.US);
+        if ("META-INF/MANIFEST.MF".equals(upper)) {
+            return true;
+        }
+        if (!upper.startsWith("META-INF/")) {
+            return false;
+        }
+
+        String fileName = upper.substring("META-INF/".length());
+        if (fileName.indexOf('/') >= 0) {
+            return false;
+        }
+        return fileName.endsWith(".SF")
+                || fileName.endsWith(".RSA")
+                || fileName.endsWith(".DSA")
+                || fileName.endsWith(".EC");
     }
 
     private static DigestResult digestZipEntry(ZipFile zipFile, ZipEntry entry) throws Exception {
@@ -1575,6 +3021,9 @@ public final class Z1Guard {
 
     private static int scoreSuspiciousPrivateFile(File file) {
         try {
+            if (isKnownRuntimePluginFile(file)) {
+                return 0;
+            }
             String name = file.getName().toLowerCase();
             if (containsHighRiskToken(name)) {
                 return 6;
@@ -1594,6 +3043,27 @@ public final class Z1Guard {
         } catch (Throwable ignored) {
         }
         return 0;
+    }
+
+    private static boolean isKnownRuntimePluginFile(File file) {
+        try {
+            String path = file.getAbsolutePath().replace('\\', '/');
+            String lowerPath = path.toLowerCase(Locale.US);
+            int marker = lowerPath.indexOf("/files/pangle_p/");
+            if (marker < 0 || !lowerPath.endsWith(".so")) {
+                return false;
+            }
+
+            String relative = lowerPath.substring(marker + "/files/pangle_p/".length());
+            if (!relative.startsWith("com.byted.")) {
+                return false;
+            }
+            return relative.indexOf("/version-") > 0
+                    && relative.indexOf("/lib/") > 0
+                    && relative.indexOf("..") < 0;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static boolean isElf(File file) {
@@ -1653,7 +3123,7 @@ public final class Z1Guard {
                     continue;
                 }
                 String lower = name.toLowerCase();
-                if (lower.indexOf("frida") >= 0 || lower.indexOf("gum-js") >= 0 || lower.indexOf("gmain") >= 0 || lower.indexOf("gdbus") >= 0) {
+                if (containsHighRiskToken(lower) || lower.indexOf("gmain") >= 0 || lower.indexOf("gdbus") >= 0) {
                     appendReason(reasons, "thread=" + name.trim());
                     return 6;
                 }
@@ -1661,6 +3131,63 @@ public final class Z1Guard {
         } catch (Throwable ignored) {
         }
         return 0;
+    }
+
+    private static int safeCheckHookClassesAndStack(StringBuilder reasons) {
+        try {
+            String[] classNames = new String[]{
+                    "de.robv.android.xposed.XposedBridge",
+                    "de.robv.android.xposed.XC_MethodHook",
+                    "org.lsposed.lspd.impl.LSPosedBridge",
+                    "org.lsposed.lspd.nativebridge.HookBridge",
+                    "org.lsposed.hiddenapibypass.HiddenApiBypass",
+                    "com.swift.sandhook.SandHook",
+                    "com.swift.sandhook.xposedcompat.XposedCompat",
+                    "me.weishu.epic.art.Epic",
+                    "me.weishu.epic.art.entry.Entry",
+                    "com.taobao.android.dexposed.DexposedBridge",
+                    "com.wind.meditor.core.FileProcesser",
+                    "com.junge.algorithmaide.AlgorithmAide"
+            };
+            for (int index = 0; index < classNames.length; index++) {
+                if (isClassPresent(classNames[index])) {
+                    appendReason(reasons, "hook-class=" + classNames[index]);
+                    return 6;
+                }
+            }
+
+            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+            if (stack != null) {
+                for (int index = 0; index < stack.length; index++) {
+                    StackTraceElement element = stack[index];
+                    if (element == null) {
+                        continue;
+                    }
+                    String token = (element.getClassName() + "." + element.getMethodName()).toLowerCase(Locale.US);
+                    if (containsHighRiskToken(token)) {
+                        appendReason(reasons, "hook-stack=" + trimReason(token));
+                        return 6;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0;
+    }
+
+    private static boolean isClassPresent(String className) {
+        try {
+            ClassLoader loader = Z1Guard.class.getClassLoader();
+            Class.forName(className, false, loader);
+            return true;
+        } catch (Throwable ignored) {
+            try {
+                Class.forName(className);
+                return true;
+            } catch (Throwable ignoredAgain) {
+                return false;
+            }
+        }
     }
 
     private static int safeCheckRootSignals(StringBuilder reasons) {
@@ -1745,6 +3272,42 @@ public final class Z1Guard {
         }
     }
 
+    private static byte[] readFileBytes(File file, int maxBytes) throws Exception {
+        FileInputStream input = null;
+        try {
+            input = new FileInputStream(file);
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int total = 0;
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                total += read;
+                if (total > maxBytes) {
+                    throw new SecurityException("file too large");
+                }
+                output.write(buffer, 0, read);
+            }
+            return output.toByteArray();
+        } finally {
+            closeQuietly(input);
+        }
+    }
+
+    private static void writeFileBytes(File file, byte[] bytes) throws Exception {
+        File parent = file.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new SecurityException("create parent failed");
+        }
+        FileOutputStream output = null;
+        try {
+            output = new FileOutputStream(file);
+            output.write(bytes);
+            output.flush();
+        } finally {
+            closeQuietly(output);
+        }
+    }
+
     private static byte[] xorBytes(byte[] bytes, byte[] key) {
         if (key == null || key.length == 0) {
             return bytes;
@@ -1760,6 +3323,19 @@ public final class Z1Guard {
     private static String sha256Hex(byte[] bytes) throws Exception {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         return bytesToHex(digest.digest(bytes));
+    }
+
+    private static String hmacSha256Hex(byte[] bytes, byte[] key) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(key, "HmacSHA256"));
+        return bytesToHex(mac.doFinal(bytes));
+    }
+
+    private static String base64Url(String value) throws Exception {
+        return Base64.encodeToString(
+                value.getBytes("UTF-8"),
+                Base64.URL_SAFE | Base64.NO_WRAP
+        );
     }
 
     private static byte[] hexToBytes(String hex) {
@@ -1818,6 +3394,64 @@ public final class Z1Guard {
         }
     }
 
+    private static final class StorageKeys {
+        private final byte[] hmacKey;
+        private final byte[] xorKey;
+
+        private StorageKeys(byte[] hmacKey, byte[] xorKey) {
+            this.hmacKey = hmacKey;
+            this.xorKey = xorKey;
+        }
+    }
+
+    private static final class StorageEntry {
+        private final String path;
+        private final long sizeBytes;
+        private final long modifiedTimeMillis;
+        private final String sha256Hex;
+
+        private StorageEntry(String path, long sizeBytes, long modifiedTimeMillis, String sha256Hex) {
+            this.path = path;
+            this.sizeBytes = sizeBytes;
+            this.modifiedTimeMillis = modifiedTimeMillis;
+            this.sha256Hex = sha256Hex;
+        }
+    }
+
+    private static final class DexLoadResult {
+        private final ArrayList<byte[]> dexBytes;
+
+        private DexLoadResult(ArrayList<byte[]> dexBytes) {
+            this.dexBytes = dexBytes;
+        }
+    }
+
+    private static final class DexEntry {
+        private final String name;
+        private final long sizeBytes;
+        private final String sha256Hex;
+        private final ArrayList<DexPart> parts;
+
+        private DexEntry(String name, long sizeBytes, String sha256Hex, ArrayList<DexPart> parts) {
+            this.name = name;
+            this.sizeBytes = sizeBytes;
+            this.sha256Hex = sha256Hex;
+            this.parts = parts;
+        }
+    }
+
+    private static final class DexPart {
+        private final String assetName;
+        private final long sizeBytes;
+        private final String sha256Hex;
+
+        private DexPart(String assetName, long sizeBytes, String sha256Hex) {
+            this.assetName = assetName;
+            this.sizeBytes = sizeBytes;
+            this.sha256Hex = sha256Hex;
+        }
+    }
+
     private static boolean containsHighRiskToken(String value) {
         return value.indexOf("frida") >= 0
                 || value.indexOf("gum-js") >= 0
@@ -1826,6 +3460,17 @@ public final class Z1Guard {
                 || value.indexOf("xposed") >= 0
                 || value.indexOf("lsposed") >= 0
                 || value.indexOf("lspatch") >= 0
+                || value.indexOf("edxp") >= 0
+                || value.indexOf("riru") >= 0
+                || value.indexOf("lspd") >= 0
+                || value.indexOf("sandhook") >= 0
+                || value.indexOf("yahfa") >= 0
+                || value.indexOf("epic") >= 0
+                || value.indexOf("whale") >= 0
+                || value.indexOf("dexposed") >= 0
+                || value.indexOf("algorithmaide") >= 0
+                || value.indexOf("algorithm") >= 0
+                || value.indexOf("junge") >= 0
                 || value.indexOf("substrate") >= 0
                 || value.indexOf("zygisk") >= 0
                 || value.indexOf("magisk") >= 0;

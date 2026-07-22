@@ -711,9 +711,13 @@ class EngineMenuController extends ChangeNotifier {
         _hardeningLogs.add('[${_timestamp()}] $log');
       }
       _hardeningLogs.addAll([
+        '[${_timestamp()}] 已注入壳 Application：com.z1.guard.Z1GuardApplication',
         '[${_timestamp()}] 已注入早启动防护 Provider：com.z1.guard.Z1GuardProvider',
-        '[${_timestamp()}] 已启用硬校验：包名、签名证书 SHA-256、APK 条目 SHA-256 摘要基线',
-        '[${_timestamp()}] 已启用运行时检测：私有目录二进制/DEX/JS、Frida/Gadget、TracerPid、异常线程、root 信号、VPN transport',
+        '[${_timestamp()}] 已启用 DEX 壳：原始 classes*.dex 加密分片并由 Guard 启动加载',
+        '[${_timestamp()}] 已启用硬校验：包名、签名证书 SHA-256、APK 条目 SHA-256 摘要基线、DEX 分片 SHA-256',
+        '[${_timestamp()}] 已启用全包产物 allowlist：未知 so/dex/asset/res/META-INF 非签名文件新增会阻断启动',
+        '[${_timestamp()}] 已启用 SP/数据库完整性保护：shared_prefs/databases 启动校验 + 运行时签名基线刷新',
+        '[${_timestamp()}] 已启用运行时检测：私有目录二进制/DEX/JS、Frida/Gadget、Xposed/LSPosed/算法助手、TracerPid、异常线程、root 信号、VPN transport',
         '[${_timestamp()}] 加固成功：${result.outputApkPath}',
       ]);
     } on ApkHardeningException catch (error) {
