@@ -232,6 +232,88 @@ class ApkHardeningService {
     return _isStorageProfileEntryPath(relativePath);
   }
 
+  Future<ApkProjectGuardDexResult> buildProjectGuardDex({
+    required String outputDexPath,
+    required String originalApplicationName,
+    required List<String> acceptedCertificateSha256,
+    int minSdk = 21,
+  }) async {
+    final javac = await _resolveJavac();
+    final d8 = await _resolveBuildToolExecutable(
+      configuredExecutable: '',
+      executableName: 'd8',
+    );
+    final androidJar = _findLatestAndroidJar();
+    if (androidJar == null) {
+      throw const ApkHardeningException('未找到 Android SDK platform android.jar');
+    }
+
+    final workDirectory = await Directory.systemTemp.createTemp(
+      'z1_project_guard_',
+    );
+    final dexXorKey = _secureRandomBytes(16);
+    final aabCodeHmacKey = _secureRandomBytes(32);
+    final logs = <String>[];
+    try {
+      final config = _GuardBuildConfig(
+        expectedPackageName: '',
+        expectedCertificateSha256: acceptedCertificateSha256
+            .map((value) => value.trim().toLowerCase())
+            .where((value) => value.isNotEmpty)
+            .join(','),
+        guardDexName: _guardDexName,
+        profileAssetName: '',
+        profileApkEntryName: '',
+        expectedProfileSha256: '',
+        profileXorKeyHex: '',
+        originalApplicationName: originalApplicationName,
+        dexPayloadConfig: 'asset:z1_guard/dex_profile.dat',
+        dexXorKeyHex: _bytesToHex(dexXorKey),
+        aabCodeProfileAssetName: 'z1_guard/aab_code_profile.dat',
+        aabCodeHmacKeyHex: _bytesToHex(aabCodeHmacKey),
+        storageHmacKeyHex: _bytesToHex(_secureRandomBytes(32)),
+        storageProfileXorKeyHex: _bytesToHex(_secureRandomBytes(16)),
+      );
+      final sourceDirectory = Directory(
+        _joinPath(workDirectory.path, 'source'),
+      );
+      final classesDirectory = Directory(
+        _joinPath(workDirectory.path, 'classes'),
+      );
+      final dexDirectory = Directory(_joinPath(workDirectory.path, 'dex'));
+      await _compileGuardDex(
+        javac: javac,
+        d8: d8,
+        androidJar: androidJar,
+        minSdk: minSdk,
+        sourceDirectory: sourceDirectory,
+        classesDirectory: classesDirectory,
+        dexDirectory: dexDirectory,
+        config: config,
+        logs: logs,
+        labelSuffix: 'project',
+      );
+
+      final generatedDex = File(_joinPath(dexDirectory.path, 'classes.dex'));
+      if (!await generatedDex.exists()) {
+        throw const ApkHardeningException('源码工程 Guard dex 生成失败');
+      }
+      final outputDex = File(outputDexPath);
+      await outputDex.parent.create(recursive: true);
+      await generatedDex.copy(outputDex.path);
+      return ApkProjectGuardDexResult(
+        outputDexPath: outputDex.path,
+        dexXorKeyHex: _bytesToHex(dexXorKey),
+        aabCodeHmacKeyHex: _bytesToHex(aabCodeHmacKey),
+        logs: logs,
+      );
+    } finally {
+      if (await workDirectory.exists()) {
+        await workDirectory.delete(recursive: true);
+      }
+    }
+  }
+
   Future<ApkHardeningResult> harden({
     required String sourceApkPath,
     required String outputApkPath,
@@ -368,6 +450,8 @@ class ApkHardeningService {
         originalApplicationName: manifestPatch.originalApplicationName,
         dexPayloadConfig: dexPayload.encodedConfig,
         dexXorKeyHex: _bytesToHex(dexXorKey),
+        aabCodeProfileAssetName: '',
+        aabCodeHmacKeyHex: '',
         storageHmacKeyHex: _bytesToHex(storageHmacKey),
         storageProfileXorKeyHex: _bytesToHex(storageProfileXorKey),
       );
@@ -432,6 +516,8 @@ class ApkHardeningService {
         originalApplicationName: manifestPatch.originalApplicationName,
         dexPayloadConfig: dexPayload.encodedConfig,
         dexXorKeyHex: _bytesToHex(dexXorKey),
+        aabCodeProfileAssetName: '',
+        aabCodeHmacKeyHex: '',
         storageHmacKeyHex: _bytesToHex(storageHmacKey),
         storageProfileXorKeyHex: _bytesToHex(storageProfileXorKey),
       );
@@ -1244,6 +1330,12 @@ class ApkHardeningService {
       return pathExecutable;
     }
 
+    for (final candidate in _commonExecutableCandidates(executableName)) {
+      if (_fileExistsSafely(candidate)) {
+        return candidate;
+      }
+    }
+
     throw ApkHardeningException('未找到 $executableName，请先安装并加入 PATH');
   }
 
@@ -1293,6 +1385,25 @@ class ApkHardeningService {
       return output.split(RegExp(r'\r?\n')).first.trim();
     } on ProcessException {
       return null;
+    }
+  }
+
+  Iterable<String> _commonExecutableCandidates(String executableName) sync* {
+    if (Platform.isWindows || executableName.contains(Platform.pathSeparator)) {
+      return;
+    }
+
+    final homeDirectory = Platform.environment['HOME']?.trim();
+    final directories = <String>[
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      '/opt/local/bin',
+      if (homeDirectory != null && homeDirectory.isNotEmpty)
+        _joinPath(homeDirectory, '.local/bin'),
+    ];
+
+    for (final directory in directories) {
+      yield _joinPath(directory, executableName);
     }
   }
 
@@ -1478,6 +1589,20 @@ class ApkHardeningResult {
   final List<String> logs;
 }
 
+class ApkProjectGuardDexResult {
+  const ApkProjectGuardDexResult({
+    required this.outputDexPath,
+    required this.dexXorKeyHex,
+    required this.aabCodeHmacKeyHex,
+    required this.logs,
+  });
+
+  final String outputDexPath;
+  final String dexXorKeyHex;
+  final String aabCodeHmacKeyHex;
+  final List<String> logs;
+}
+
 class ApkHardeningDexPayloadTestResult {
   const ApkHardeningDexPayloadTestResult({
     required this.encodedConfig,
@@ -1529,6 +1654,8 @@ class _GuardBuildConfig {
     required this.originalApplicationName,
     required this.dexPayloadConfig,
     required this.dexXorKeyHex,
+    required this.aabCodeProfileAssetName,
+    required this.aabCodeHmacKeyHex,
     required this.storageHmacKeyHex,
     required this.storageProfileXorKeyHex,
   });
@@ -1543,6 +1670,8 @@ class _GuardBuildConfig {
   final String originalApplicationName;
   final String dexPayloadConfig;
   final String dexXorKeyHex;
+  final String aabCodeProfileAssetName;
+  final String aabCodeHmacKeyHex;
   final String storageHmacKeyHex;
   final String storageProfileXorKeyHex;
 }
@@ -1693,6 +1822,14 @@ String _buildGuardJava(_GuardBuildConfig config) {
       )
       .replaceAll('__DEX_XOR_KEY_HEX__', _javaString(config.dexXorKeyHex))
       .replaceAll(
+        '__AAB_CODE_PROFILE_ASSET_NAME__',
+        _javaString(config.aabCodeProfileAssetName),
+      )
+      .replaceAll(
+        '__AAB_CODE_HMAC_KEY_HEX__',
+        _javaString(config.aabCodeHmacKeyHex),
+      )
+      .replaceAll(
         '__STORAGE_HMAC_KEY_HEX__',
         _javaString(config.storageHmacKeyHex),
       )
@@ -1836,6 +1973,8 @@ public final class Z1Guard {
     private static final String ORIGINAL_APPLICATION_NAME = __ORIGINAL_APPLICATION_NAME__;
     private static final String DEX_PAYLOAD_CONFIG = __DEX_PAYLOAD_CONFIG__;
     private static final String DEX_XOR_KEY_HEX = __DEX_XOR_KEY_HEX__;
+    private static final String AAB_CODE_PROFILE_ASSET_NAME = __AAB_CODE_PROFILE_ASSET_NAME__;
+    private static final String AAB_CODE_HMAC_KEY_HEX = __AAB_CODE_HMAC_KEY_HEX__;
     private static final String STORAGE_HMAC_KEY_HEX = __STORAGE_HMAC_KEY_HEX__;
     private static final String STORAGE_PROFILE_XOR_KEY_HEX = __STORAGE_PROFILE_XOR_KEY_HEX__;
     private static final int PROFILE_READ_LIMIT_BYTES = 16 * 1024 * 1024;
@@ -1877,6 +2016,7 @@ public final class Z1Guard {
         score += safeCheckPackageName(appContext, reasons);
         score += safeCheckSigningCertificate(appContext, reasons);
         score += safeCheckApkIntegrity(appContext, reasons);
+        score += safeCheckAabCodeIntegrity(appContext, reasons);
         score += safeCheckStorageIntegrity(appContext, reasons);
         score += safeCheckDebuggable(appContext, reasons);
         score += safeCheckTracerPid(reasons);
@@ -2032,7 +2172,15 @@ public final class Z1Guard {
     }
 
     private static DexLoadResult loadDexPayload(Context context) throws Exception {
-        byte[] configBytes = Base64.decode(DEX_PAYLOAD_CONFIG, Base64.URL_SAFE | Base64.NO_WRAP);
+        String encodedConfig = DEX_PAYLOAD_CONFIG;
+        if (encodedConfig.startsWith("asset:")) {
+            String assetName = encodedConfig.substring("asset:".length());
+            encodedConfig = new String(
+                    readAssetBytes(context, assetName, PROFILE_READ_LIMIT_BYTES),
+                    "UTF-8"
+            ).trim();
+        }
+        byte[] configBytes = Base64.decode(encodedConfig, Base64.URL_SAFE | Base64.NO_WRAP);
         String text = new String(configBytes, "UTF-8");
         String[] lines = text.split("\\r?\\n");
         if (lines.length == 0) {
@@ -2283,8 +2431,8 @@ public final class Z1Guard {
 
     private static int safeCheckPackageName(Context context, StringBuilder reasons) {
         try {
-            String packageName = context.getPackageName();
-            if (!EXPECTED_PACKAGE_NAME.equals(packageName)) {
+        String packageName = context.getPackageName();
+        if (EXPECTED_PACKAGE_NAME.length() > 0 && !EXPECTED_PACKAGE_NAME.equals(packageName)) {
                 appendReason(reasons, "package-name=" + packageName);
                 return 10;
             }
@@ -2325,8 +2473,12 @@ public final class Z1Guard {
                 if (firstDigest.length() == 0) {
                     firstDigest = digest;
                 }
-                if (EXPECTED_CERTIFICATE_SHA256.equalsIgnoreCase(digest)) {
-                    return 0;
+                String[] expectedCertificates = EXPECTED_CERTIFICATE_SHA256.split(",", -1);
+                for (int expectedIndex = 0; expectedIndex < expectedCertificates.length; expectedIndex++) {
+                    String expectedCertificate = expectedCertificates[expectedIndex].trim();
+                    if (expectedCertificate.length() > 0 && expectedCertificate.equalsIgnoreCase(digest)) {
+                        return 0;
+                    }
                 }
             }
 
@@ -2380,6 +2532,172 @@ public final class Z1Guard {
             appendReason(reasons, "apk-integrity-check-error");
             return 10;
         }
+    }
+
+    private static int safeCheckAabCodeIntegrity(Context context, StringBuilder reasons) {
+        if (AAB_CODE_PROFILE_ASSET_NAME.length() == 0 || AAB_CODE_HMAC_KEY_HEX.length() == 0) {
+            return 0;
+        }
+
+        try {
+            byte[] profileBytes = readAssetBytes(
+                    context,
+                    AAB_CODE_PROFILE_ASSET_NAME,
+                    PROFILE_READ_LIMIT_BYTES
+            );
+            AabCodeProfile profile = parseAabCodeProfile(profileBytes);
+            ApplicationInfo info = context.getApplicationInfo();
+            if (info == null || info.sourceDir == null || info.sourceDir.length() == 0) {
+                appendReason(reasons, "missing-aab-source-apk");
+                return 10;
+            }
+
+            ArrayList<String> apkPaths = new ArrayList<String>();
+            apkPaths.add(info.sourceDir);
+            if (info.splitSourceDirs != null) {
+                for (int index = 0; index < info.splitSourceDirs.length; index++) {
+                    String splitPath = info.splitSourceDirs[index];
+                    if (splitPath != null && splitPath.length() > 0) {
+                        apkPaths.add(splitPath);
+                    }
+                }
+            }
+
+            boolean guardDexFound = false;
+            int actualCodeEntries = 0;
+            for (int pathIndex = 0; pathIndex < apkPaths.size(); pathIndex++) {
+                ZipFile zipFile = null;
+                try {
+                    zipFile = new ZipFile(apkPaths.get(pathIndex));
+                    Enumeration<? extends ZipEntry> entries = zipFile.entries();
+                    while (entries.hasMoreElements()) {
+                        ZipEntry entry = entries.nextElement();
+                        if (entry == null || entry.isDirectory()) {
+                            continue;
+                        }
+                        String name = normalizeZipEntryName(entry.getName());
+                        if (!isAabRuntimeCodeEntry(name)) {
+                            continue;
+                        }
+
+                        actualCodeEntries++;
+                        String digest = digestZipEntry(zipFile, entry).sha256Hex;
+                        if (!profile.allowedSha256.contains(digest)) {
+                            appendReason(reasons, "unexpected-aab-code=" + trimReason(name));
+                            return 10;
+                        }
+                        if (pathIndex == 0
+                                && isRootDexEntry(name)
+                                && profile.guardDexSha256.equalsIgnoreCase(digest)) {
+                            guardDexFound = true;
+                        }
+                    }
+                } finally {
+                    closeQuietly(zipFile);
+                }
+            }
+
+            if (!guardDexFound) {
+                appendReason(reasons, "missing-aab-guard-dex");
+                return 10;
+            }
+            if (actualCodeEntries == 0) {
+                appendReason(reasons, "empty-aab-code");
+                return 10;
+            }
+            return 0;
+        } catch (Throwable error) {
+            appendReason(reasons, "aab-code-check-error");
+            return 10;
+        }
+    }
+
+    private static AabCodeProfile parseAabCodeProfile(byte[] profileBytes) throws Exception {
+        String text = new String(profileBytes, "UTF-8");
+        int firstNewline = text.indexOf('\n');
+        if (firstNewline <= 0) {
+            throw new SecurityException("bad aab code profile");
+        }
+
+        String[] header = text.substring(0, firstNewline).split("\\|", -1);
+        if (header.length != 3
+                || !"Z1AABCODEPROFILE".equals(header[0])
+                || !"1".equals(header[1])) {
+            throw new SecurityException("bad aab code profile header");
+        }
+
+        String body = text.substring(firstNewline + 1);
+        String actualHmac = hmacSha256Hex(
+                body.getBytes("UTF-8"),
+                hexToBytes(AAB_CODE_HMAC_KEY_HEX)
+        );
+        if (!actualHmac.equalsIgnoreCase(header[2])) {
+            throw new SecurityException("bad aab code profile hmac");
+        }
+
+        HashSet<String> allowedSha256 = new HashSet<String>();
+        String guardDexSha256 = "";
+        String[] lines = body.split("\\r?\\n");
+        for (int index = 0; index < lines.length; index++) {
+            String line = lines[index];
+            if (line == null || line.length() == 0) {
+                continue;
+            }
+            String[] parts = line.split("\\|", -1);
+            if (parts.length != 2 || !isSha256Hex(parts[1])) {
+                throw new SecurityException("bad aab code profile line");
+            }
+            String digest = parts[1].toLowerCase(Locale.US);
+            if ("guard".equals(parts[0])) {
+                if (guardDexSha256.length() != 0) {
+                    throw new SecurityException("duplicate aab guard digest");
+                }
+                guardDexSha256 = digest;
+            } else if (!"allow".equals(parts[0])) {
+                throw new SecurityException("bad aab code profile type");
+            }
+            allowedSha256.add(digest);
+        }
+        if (guardDexSha256.length() == 0 || allowedSha256.isEmpty()) {
+            throw new SecurityException("empty aab code profile");
+        }
+        return new AabCodeProfile(guardDexSha256, allowedSha256);
+    }
+
+    private static boolean isAabRuntimeCodeEntry(String name) {
+        return isRootDexEntry(name)
+                || (name.startsWith("lib/")
+                && name.endsWith(".so")
+                && name.indexOf('/', "lib/".length()) > "lib/".length());
+    }
+
+    private static boolean isRootDexEntry(String name) {
+        if (!name.startsWith("classes") || !name.endsWith(".dex")) {
+            return false;
+        }
+        String suffix = name.substring("classes".length(), name.length() - ".dex".length());
+        if (suffix.length() == 0) {
+            return true;
+        }
+        for (int index = 0; index < suffix.length(); index++) {
+            if (!Character.isDigit(suffix.charAt(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isSha256Hex(String value) {
+        if (value == null || value.length() != 64) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            char character = Character.toLowerCase(value.charAt(index));
+            if (!Character.isDigit(character) && (character < 'a' || character > 'f')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static int safeCheckStorageIntegrity(Context context, StringBuilder reasons) {
@@ -3372,6 +3690,16 @@ public final class Z1Guard {
             return digest == null ? "" : digest;
         }
         return digest.substring(0, 16);
+    }
+
+    private static final class AabCodeProfile {
+        private final String guardDexSha256;
+        private final HashSet<String> allowedSha256;
+
+        private AabCodeProfile(String guardDexSha256, HashSet<String> allowedSha256) {
+            this.guardDexSha256 = guardDexSha256;
+            this.allowedSha256 = allowedSha256;
+        }
     }
 
     private static final class ExpectedEntry {

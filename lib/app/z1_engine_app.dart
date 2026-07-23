@@ -2,14 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:z1_engine/features/home/controllers/engine_menu_controller.dart';
 import 'package:z1_engine/features/home/pages/engine_home_page.dart';
+import 'package:z1_engine/features/protect/controllers/hardening_controller.dart';
 
 class Z1EngineApp extends StatelessWidget {
   const Z1EngineApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => EngineMenuController(),
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => EngineMenuController()),
+        ChangeNotifierProvider(create: (_) => HardeningController()),
+      ],
       child: MaterialApp(
         title: 'Z1 Engine',
         debugShowCheckedModeBanner: false,
